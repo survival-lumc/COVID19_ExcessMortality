@@ -1,0 +1,627 @@
+---
+title: "dataset 2020-2021"
+output: html_document
+date: "`r Sys.Date()`"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(haven)
+library(gridExtra)
+
+theme_set(theme_bw())
+theme_update(panel.background = element_rect(fill = "white"))
+```
+
+```{r combine data_2020 and data_2021}
+# combine data_2020 and data_2021 created by "1. create datasets per year"
+data_2020_2021 <- full_join(
+  readRDS("data_2020.rds") %>%
+    select(
+      RINPERSOON, GBAGESLACHT, GBAPOSTCODE4GAAF1JANUARI, BIRTHDAY, date_death, start, stop),
+  readRDS("data_2021.rds") %>%
+    select(
+      RINPERSOON, GBAGESLACHT, GBAPOSTCODE4GAAF1JANUARI, BIRTHDAY, date_death, start, stop),
+  by = "RINPERSOON", suffix = c("_20", "_21"))
+any(duplicated(data_2020_2021$RINPERSOON)) # no
+nrow(data_2020_2021)
+
+#### different values? ####
+data_2020_2021 %>%
+  filter(GBAGESLACHT_20 != GBAGESLACHT_21) %>%
+  select(GBAGESLACHT_20, GBAGESLACHT_21)
+# if _21 present, use _21 value, else use _20
+data_2020_2021 <- data_2020_2021 %>%
+  mutate(
+    GBAGESLACHT = ifelse(!is.na(GBAGESLACHT_21),
+      as.character(GBAGESLACHT_21), as.character(GBAGESLACHT_20)), .keep = "unused")
+
+# don't combine GBAPOSTCODE4GAAF1JANUARI (persons can move)
+
+data_2020_2021 %>%
+  filter(BIRTHDAY_20 != BIRTHDAY_21) %>%
+  select(BIRTHDAY_20, BIRTHDAY_21)
+# if _21 present, use _21 value, else use _20
+data_2020_2021 <- data_2020_2021 %>%
+  mutate(
+    BIRTHDAY = as.Date(ifelse(!is.na(BIRTHDAY_21), BIRTHDAY_21, BIRTHDAY_20),
+      origin = "1970-01-01"), .keep = "unused")
+
+data_2020_2021 %>%
+  filter(date_death_20 != date_death_21) %>%
+  select(date_death_20, date_death_21)
+# if _21 present, use _21 value, else use _20
+data_2020_2021 <- data_2020_2021 %>%
+  mutate(date_death = as.Date(ifelse(!is.na(date_death_21), date_death_21, date_death_20),
+    origin = "1970-01-01"), .keep = "unused")
+
+#### age at 1 Jan 2020 ####
+data_2020_2021 <- data_2020_2021 %>%
+  mutate(
+    age_31Dec21 = as.numeric(as.Date("2021-12-31") - BIRTHDAY) / 365.241,
+    age_1Jan20 = as.numeric(as.Date("2020-01-01") - BIRTHDAY) / 365.241,
+    age_1Jan20_cat = cut(age_1Jan20,
+      breaks = c(-Inf, 65, 70, 80, 90, Inf),
+      labels = c("<65", "65-69", "70-79", "80-89", ">=90")))
+data_2020_2021 %>%
+  group_by(age_1Jan20_cat) %>%
+  summarise(n(), min(age_1Jan20), max(age_1Jan20), min(BIRTHDAY), max(BIRTHDAY))
+# still includes the 63yo in 2021
+data_2020_2021 %>%
+  filter(age_31Dec21 < 65) %>%
+  summarise(
+    n(), min(age_31Dec21), max(age_31Dec21),
+    min(age_1Jan20), max(age_1Jan20), min(BIRTHDAY), max(BIRTHDAY)) %>%
+  mutate(across(-`n()`, ~ format(.x, digits = 6))) %>%
+  print(width = Inf)
+# remove
+data_2020_2021 <- data_2020_2021 %>% filter(age_31Dec21 >= 65)
+nrow(data_2020_2021)
+data_2020_2021 %>%
+  group_by(age_1Jan20_cat) %>%
+  summarise(n(), min(age_1Jan20), max(age_1Jan20), min(BIRTHDAY), max(BIRTHDAY))
+# OK
+
+#### create new start and stop ####
+# check: is there anyone who died since 1 January 2021 but had no postcode?
+any(!is.na(data_2020_2021$date_death) & data_2020_2021$date_death < "2021-01-01" &
+  is.na(data_2020_2021$GBAPOSTCODE4GAAF1JANUARI_20)) 
+any(!is.na(data_2020_2021$date_death) & data_2020_2021$date_death >= "2021-01-01" &
+  is.na(data_2020_2021$GBAPOSTCODE4GAAF1JANUARI_21)) 
+data_2020_2021 %>%
+  filter(!is.na(date_death) & date_death >= "2021-01-01" &
+    is.na(GBAPOSTCODE4GAAF1JANUARI_21)) %>%
+  select(
+    GBAPOSTCODE4GAAF1JANUARI_20, GBAPOSTCODE4GAAF1JANUARI_21, start_20, stop_20,
+    start_21, stop_21, date_death)
+# ignore death if >=2022
+# missing postcode but known death in 2021 (unclear why this happened for a few) -> consider as emigration (at 2021-01-01)
+data_2020_2021 <- data_2020_2021 %>%
+  mutate(
+    start = as.Date(
+      ifelse(!is.na(GBAPOSTCODE4GAAF1JANUARI_20), as.Date("2019-12-31"), as.Date("2020-12-31")),
+      origin = "1970-01-01"),
+    stop = as.Date(
+      ifelse(is.na(GBAPOSTCODE4GAAF1JANUARI_21), as.Date("2020-12-31"), as.Date("2021-12-31")),
+      origin = "1970-01-01"),
+    stop = as.Date(
+      ifelse(!is.na(date_death) & date_death <= stop, date_death, stop),
+      origin = "1970-01-01"))
+# check:
+data_2020_2021 %>%
+  mutate(POSTCODE20 = ifelse(!is.na(GBAPOSTCODE4GAAF1JANUARI_20), 1, 0),
+         POSTCODE21 = ifelse(!is.na(GBAPOSTCODE4GAAF1JANUARI_21), 1, 0)) %>%
+  group_by(POSTCODE20, POSTCODE21) %>% 
+  summarise(
+    n=n(), 
+    death_before20 = length(which(!is.na(date_death) & date_death < as.Date("2020-01-01"))),
+    death_in20 = length(which(!is.na(date_death) & grepl("2020", as.character(date_death)))),
+    death_in21 = length(which(!is.na(date_death) & grepl("2021", as.character(date_death)))),
+    death_after21 = length(which(!is.na(date_death) & date_death >= as.Date("2022-01-01"))),
+    min(start), max(start), min(stop), max(stop), .groups="drop") %>%
+  arrange(desc(POSTCODE20), POSTCODE21) %>%
+  print(width=Inf)
+data_2020_2021 %>% filter(start >= stop)
+```
+
+# add additional data (COVID-19 vaccination and test results):
+```{r add CIMS}
+#### CIMS for vaccinations ####
+CIMS <-
+  read_sav("G:/GezondheidWelzijn/CIMS/CIMSdata_20241001.sav") %>% # version used for analyses of paper 
+  as_factor(only_labelled = T) %>%
+  filter(Rinpersoon %in% data_2020_2021$RINPERSOON) %>% # keep only the included persons
+  rename(RINPERSOON = Rinpersoon) %>%
+  left_join(data_2020_2021 %>% 
+              select(RINPERSOON, start, stop, GBAPOSTCODE4GAAF1JANUARI_21, date_death))
+head(CIMS)
+CIMS <- CIMS %>% # create vaccination date variable
+  mutate(date_vaccination = as.Date(
+    paste(substr(Vaccinatiedatum, 1, 4),
+      substr(Vaccinatiedatum, 5, 6),
+      substr(Vaccinatiedatum, 7, 8),
+      sep = "-"),
+    format = "%Y-%m-%d"))
+head(CIMS %>% select(Vaccinatiedatum, date_vaccination))
+range(CIMS$Vaccinatiedatum)
+
+# vaccinations within relevant time period
+CIMS <- CIMS %>% filter(date_vaccination < as.Date("2022-01-01")) # keep only 2020-2021
+nrow(CIMS)
+
+CIMS %>% # any before or at time of start?
+  filter(date_vaccination <= start) %>%
+  select(date_vaccination, VaccinatieRangnummer) # none
+CIMS %>% # any at time of stop?
+  filter(date_vaccination == stop) %>%
+  mutate(n = n()) %>%
+  select(n, date_vaccination, stop, date_death) %>%
+  mutate(on_day_of = ifelse(!is.na(date_death) & date_death == date_vaccination, "death",
+    ifelse(date_vaccination == as.Date("2021-12-31"), "endFU", "other"))) %>%
+  group_by(n, on_day_of) %>%
+  summarise(n_sub = n())
+# some vaccinations occur on day of death or last day of follow-up
+# -> set vaccination date to one day earlier (multi-state model cannot handle 2 'simultaneous' events)
+CIMS <- CIMS %>%
+  mutate(
+    date_vaccination_old = date_vaccination,
+    date_vaccination = as.Date(
+      ifelse(date_vaccination == stop,
+        date_vaccination - 1, date_vaccination),
+      origin = "1970-01-01"))
+CIMS %>%
+  filter(date_vaccination_old == stop) %>%
+  select(contains("date_vacc"))
+
+CIMS %>% # any after stop?
+  filter(date_vaccination > stop) %>%
+  mutate(type = case_when(
+    is.na(GBAPOSTCODE4GAAF1JANUARI_21) & date_vaccination >= as.Date("2020-01-01") ~ "after emigration",
+    !is.na(date_death) & date_death < date_vaccination ~ "after death",
+    T ~ "other")) %>%
+  count(type)
+# most after emigration, some after death
+CIMS %>% # check vaccination after death:
+  filter(date_vaccination > date_death & !is.na(GBAPOSTCODE4GAAF1JANUARI_21)) %>% 
+  select(RINPERSOON, date_vaccination, date_death, VaccinatieRangnummer, Vaccinatielabel) %>%
+  mutate(diff = date_vaccination - date_death)
+# set vaccination date to one day before death if the vaccination date is after death (likely delay in reporting)
+CIMS <- CIMS %>%
+  mutate(
+    date_vaccination_old = as.Date(
+      ifelse(!is.na(date_death) & date_vaccination > date_death &
+               !is.na(GBAPOSTCODE4GAAF1JANUARI_21),
+        date_vaccination, date_vaccination_old),
+      origin = "1970-01-01"),
+    date_vaccination = as.Date(
+      ifelse(!is.na(date_death) & date_vaccination > date_death &
+               !is.na(GBAPOSTCODE4GAAF1JANUARI_21),
+        date_death - 1, date_vaccination),
+      origin = "1970-01-01"))
+
+# remove all other vaccinations (after emigration)
+CIMS <- CIMS %>% filter(date_vaccination < stop)
+nrow(CIMS)
+
+table(CIMS$Vaccinatielabel, CIMS$VaccinatieRangnummer, useNA = "ifany") 
+# rules vaccinatielabel (see CIMS documentation):
+# max 3 basis vaccinations per person
+# interval between 2 basis vaccinations is >= 21 days
+# interval between last basis vaccination and first booster is >= 60 days
+# if multiple vaccinations on 1 day, prefer GGD vaccination
+# dose and type of vaccination was approved for age group at time of administration
+
+# keep max one vaccination per day per person:
+CIMS <- CIMS %>%
+  group_by(RINPERSOON, date_vaccination) %>%
+  mutate(day_total = n(),
+         nr = 1, nr = cumsum(nr),
+         label_afkeur = ifelse(!is.na(Vaccinatielabel) & Vaccinatielabel == "Afkeur",
+                               "Afkeur", "other"),
+         total_afkeur = length(which(label_afkeur == "Afkeur"))) %>%
+  ungroup() 
+CIMS %>% filter(day_total > 1 & total_afkeur < day_total) %>% 
+  select(RINPERSOON, date_vaccination, day_total, label_afkeur, Vaccinatielabel) %>% 
+  print() %>%
+  filter(label_afkeur == "Afkeur") # remove these rows 
+nrow(CIMS)
+CIMS <- CIMS %>% filter(!(day_total > 1 & total_afkeur < day_total & label_afkeur == "Afkeur"))
+nrow(CIMS) # OK
+
+CIMS %>% filter(day_total > 1) %>%
+  group_by(RINPERSOON, date_vaccination) %>%
+  mutate(day_total = n()) %>% ungroup() %>%
+  filter(day_total > 1) %>%
+  count(day_total, label_afkeur, VaccinatieRangnummer)
+# keep only the first of each day
+CIMS <- CIMS %>%
+  group_by(RINPERSOON, date_vaccination) %>%
+  mutate(nr = 1, nr = cumsum(nr)) %>% 
+  ungroup() 
+CIMS %>% count(nr) 
+CIMS <- CIMS %>% filter(nr == 1)
+nrow(CIMS)
+
+CIMS %>% count(label_afkeur, Vaccinatielabel) # still some afkeur
+CIMS %>% count(label_afkeur, VaccinatieRangnummer) 
+
+CIMS %>% filter(RINPERSOON %in% RINPERSOON[label_afkeur == "Afkeur"]) %>%
+  select(RINPERSOON, date_vaccination, Vaccinatiebatch:Vaccinatielabel) %>% print(width = Inf)
+
+CIMS %>% filter(RINPERSOON %in% RINPERSOON[label_afkeur == "Afkeur" & 
+                                             !duplicated(RINPERSOON)]) %>%
+  select(RINPERSOON, date_vaccination, Vaccinatiebatch:Vaccinatielabel) %>% print(width = Inf) %>%
+  filter(Vaccinatielabel == "Afkeur" & !duplicated(RINPERSOON)) %>% 
+  count(Vaccinatielabel, VaccinatieRangnummer)
+# also some for first vaccination... However, most 'afkeur' for first vaccination seem like a 'real' vaccination except that not all information is present/correct. Since we only need the vaccination date, keep these few vaccinations in the dataset.
+
+# keep all vaccinations still present in dataset and add to data_2020_2021
+data_2020_2021 <- data_2020_2021 %>%
+  left_join(CIMS %>% filter(!duplicated(RINPERSOON)) %>%
+    select(RINPERSOON, date_vaccination, Vaccinatielabel, VaccinatieRangnummer))
+data_2020_2021 %>% count(Vaccinatielabel, VaccinatieRangnummer)
+
+# free some memory:
+saveRDS(CIMS, "CIMS.rds")
+rm(CIMS)
+gc()
+```
+
+```{r add GGDCOVID19BM}
+#### GGDCOVID19BM for COVID-19 tests ####
+GGDCOVID19BM_2020 <-
+  read_sav("G:/GezondheidWelzijn/GGDCOVID19BM/HPZonedata_2020V1.sav") %>%
+  as_factor(only_labelled = T) %>%
+  filter(RINPERSOON %in% data_2020_2021$RINPERSOON) %>%
+  left_join(data_2020_2021 %>% select(RINPERSOON, start, stop, date_death))
+head(GGDCOVID19BM_2020)
+range(GGDCOVID19BM_2020$TijdstiprapportageCOVID19besmetting)
+range(GGDCOVID19BM_2020$DatumCOVID19testafname[GGDCOVID19BM_2020$DatumCOVID19testafname != ""])
+
+GGDCOVID19BM_2021 <-
+  read_sav("G:/GezondheidWelzijn/GGDCOVID19BM/HPZonedata_2021V1.sav") %>%
+  as_factor(only_labelled = T) %>%
+  rename(RINPERSOON = Rinpersoon) %>%
+  filter(RINPERSOON %in% data_2020_2021$RINPERSOON) %>%
+  left_join(data_2020_2021 %>% select(RINPERSOON, start, stop, date_death))
+head(GGDCOVID19BM_2021)
+range(GGDCOVID19BM_2021$TijdstiprapportageCOVID19besmetting)
+range(GGDCOVID19BM_2021$DatumCOVID19testafname[GGDCOVID19BM_2021$DatumCOVID19testafname != ""])
+# also before 2020?
+
+# create dataset (remove invalid testing dates)
+GGDCOVID19BM <- rbind(
+  GGDCOVID19BM_2020 %>% mutate(year = 2020), GGDCOVID19BM_2021 %>% mutate(year = 2021)) %>%
+  mutate(
+    date_report = as.Date(TijdstiprapportageCOVID19besmetting), 
+    date_test = ifelse(DatumCOVID19testafname == "", NA, DatumCOVID19testafname), 
+    date_test = as.Date(DatumCOVID19testafname, format = "%Y%m%d"),
+    date_test = case_when(
+      date_test < as.Date("2020-02-27") ~ NA, # first official COVID-19 case in NL
+      abs(date_test - date_report) >= 365 ~ NA, # certainly incorrect if 1 year difference
+      T ~ date_test))
+GGDCOVID19BM %>%
+  filter(is.na(date_test) & DatumCOVID19testafname != "") %>%
+  select(date_test, date_report, TijdstiprapportageCOVID19besmetting, DatumCOVID19testafname) %>%
+  arrange(DatumCOVID19testafname) # OK
+# create infection date variable (test or report, whichever occurs first)
+GGDCOVID19BM <- GGDCOVID19BM %>% 
+  mutate(date_infection = pmin(date_report, date_test, na.rm = T))
+         
+rm(GGDCOVID19BM_2020)
+rm(GGDCOVID19BM_2021)
+gc()
+
+nrow(GGDCOVID19BM) 
+nrow(unique(GGDCOVID19BM)) # some duplicate rows are present
+GGDCOVID19BM <- unique(GGDCOVID19BM)
+
+# check
+head(GGDCOVID19BM %>%
+  select(DatumCOVID19testafname, TijdstiprapportageCOVID19besmetting, date_infection), n = 10) 
+head(GGDCOVID19BM %>% filter(DatumCOVID19testafname != "") %>%
+  select(DatumCOVID19testafname, TijdstiprapportageCOVID19besmetting, date_infection), n = 10) 
+GGDCOVID19BM %>% # different years:
+  filter(DatumCOVID19testafname != "" & 
+           substr(DatumCOVID19testafname, 1, 4) != substr(as.character(date_infection), 1, 4)) %>%
+  select(DatumCOVID19testafname, TijdstiprapportageCOVID19besmetting, date_infection, year) %>%
+  arrange(DatumCOVID19testafname) %>% print(n = Inf)
+GGDCOVID19BM %>%
+  group_by(year) %>%
+  summarise(min(date_infection), max(date_infection))
+GGDCOVID19BM %>%
+  filter(year == 2021 & date_infection < as.Date("2021-01-01")) %>%
+  select(RINPERSOON, TijdstiprapportageCOVID19besmetting, DatumCOVID19testafname,
+         year:date_infection) %>%
+  print(n = Inf) # few, most seem OK
+
+# test result options:
+GGDCOVID19BM %>%
+  group_by(TypeCOVID19test, TypeuitslagCOVID19test) %>%
+  summarise(n = n()) %>%
+  print(n = Inf)
+GGDCOVID19BM <- GGDCOVID19BM %>%
+  mutate(test = ifelse(grepl("Positief|Vermoedelijk|Doorgemaakt", TypeuitslagCOVID19test),
+    "positive", "negative"))
+GGDCOVID19BM %>%
+  group_by(test, TypeuitslagCOVID19test) %>%
+  summarise(n = n()) %>%
+  print(n = Inf)
+
+#### dataset with only positive test results ####
+GGDCOVID19BM_pos <- GGDCOVID19BM %>%
+  filter(test == "positive") %>%
+  select(RINPERSOON, start, stop, date_death, year, date_report, date_test, date_infection) %>%
+  unique() %>% # sometimes >1 test per day
+  arrange(RINPERSOON, date_infection) %>%
+  mutate(int_start = ifelse(date_infection < start, "before start", "since start")) %>% # group by before/after start (to allow for starting in infection state for immigrated persons in the multi-state model)
+  group_by(RINPERSOON, int_start) %>%
+  mutate(
+    nr_period = 1, nr_period = cumsum(nr_period),
+    nr_period = ifelse(int_start == "before start", 0, nr_period)) %>%
+  group_by(RINPERSOON) %>%
+  mutate(nr = 1, nr = cumsum(nr)) %>%
+  ungroup()
+head(GGDCOVID19BM_pos)
+
+# check
+GGDCOVID19BM_pos %>%
+  filter(RINPERSOON %in% RINPERSOON[int_start == "before start"]) %>%
+  select(RINPERSOON, date_infection, start, nr_period, nr, int_start)
+GGDCOVID19BM_pos %>%
+  filter(date_infection > stop) %>%
+  select(date_infection, start, stop, date_death)
+# some rows after stop, often after death!
+GGDCOVID19BM_pos %>% filter(!is.na(date_death) & date_infection > date_death) %>%
+  mutate(diff = date_infection - date_death) %>% count(diff) %>% print(n=Inf)
+GGDCOVID19BM_pos %>% filter(!is.na(date_death) & date_infection > date_death) %>%
+    mutate(diff = date_infection - date_death) %>% filter(diff>31) %>%
+  select(RINPERSOON, date_death:date_infection, diff) %>% arrange(diff)
+# also some have registration of COVID-19 infection >1 month after death... (likely reporting delay)
+
+# if date_infection >= date_death, set date_infection to 1 day before death:
+GGDCOVID19BM_pos <- GGDCOVID19BM_pos %>%
+  mutate(
+    date_infection_old = date_infection,
+    date_infection = as.Date(ifelse(!is.na(date_death) & date_infection >= date_death,
+      date_death - 1, date_infection), origin = "1970-01-01"))
+GGDCOVID19BM_pos %>%
+  filter(date_infection == date_infection_old & !is.na(date_death)) %>%
+  select(date_infection_old, date_infection, start, stop, date_death) # OK
+
+GGDCOVID19BM_pos %>%
+  filter(date_infection > stop) %>%
+  select(RINPERSOON, date_infection, start, stop, date_death) %>% arrange(date_death) %>%
+  left_join(data_2020_2021 %>% select(RINPERSOON, GBAPOSTCODE4GAAF1JANUARI_21)) %>% print() %>%
+  count(GBAPOSTCODE4GAAF1JANUARI_21)
+# after emigration day -> remove
+
+nrow(GGDCOVID19BM_pos) 
+GGDCOVID19BM_pos <- GGDCOVID19BM_pos %>% filter(date_infection <= stop)
+nrow(GGDCOVID19BM_pos) 
+
+GGDCOVID19BM_pos %>%
+  filter(RINPERSOON %in% RINPERSOON[date_infection < start]) %>%
+  select(RINPERSOON, date_infection, start, int_start, nr, nr_period)
+
+#### separate dataset ignoring infections before June 2020 ####
+GGDCOVID19BM_pos_Jun20 <- GGDCOVID19BM_pos %>%
+  filter(date_infection >= as.Date("2020-06-01")) %>%
+  select(RINPERSOON, start:date_death, date_infection) %>%
+  unique() %>%
+  arrange(RINPERSOON, date_infection) %>%
+  mutate(
+    start = as.Date(ifelse(start > as.Date("2020-06-01"), start, as.Date("2020-06-01")),
+      origin = "1970-01-01"),
+    int_start = ifelse(date_infection < start, "before start", "since start")) %>%
+  group_by(RINPERSOON, int_start) %>%
+  mutate(
+    nr_period = 1, nr_period = cumsum(nr_period),
+    nr_period = ifelse(int_start == "before start", 0, nr_period),
+    total_period = max(nr_period)) %>%
+  group_by(RINPERSOON) %>%
+  mutate(nr = 1, nr = cumsum(nr), total = max(nr)) %>%
+  ungroup()
+
+#### infections with "recovery" ####
+# acute infection period: first 28 days after positive test (after that: recovery/non-recent infection)
+# reinfection allowed from 90 days after start of previous acute infection period
+
+GGDCOVID19BM_pos_Jun20 %>% count(nr_period) %>% print(n=Inf)
+
+GGDCOVID19BM_pos_Jun20_rec <- GGDCOVID19BM_pos_Jun20 %>%
+  select(RINPERSOON, start:date_death, date_infection, int_start, total) %>%
+  unique() %>%
+  arrange(RINPERSOON, date_infection) %>%
+  group_by(RINPERSOON) %>%
+  mutate(
+    infect = min(date_infection),
+    infect_nr = 1,
+    remove = 0) %>%
+  ungroup()
+
+# create remove variable for tests < 90 days
+for (i in unique(GGDCOVID19BM_pos_Jun20_rec$RINPERSOON[GGDCOVID19BM_pos_Jun20_rec$total > 1])) {
+   for (j in which(GGDCOVID19BM_pos_Jun20_rec$RINPERSOON == i)[
+     2:length(which(GGDCOVID19BM_pos_Jun20_rec$RINPERSOON == i))]) {
+    if (GGDCOVID19BM_pos_Jun20_rec$date_infection[j] <= GGDCOVID19BM_pos_Jun20_rec$infect[j] + 90) {
+      GGDCOVID19BM_pos_Jun20_rec$remove[j] <- 1
+    } else {
+      GGDCOVID19BM_pos_Jun20_rec$infect_nr[GGDCOVID19BM_pos_Jun20_rec$RINPERSOON == i &
+        GGDCOVID19BM_pos_Jun20_rec$date_infection >=
+          GGDCOVID19BM_pos_Jun20_rec$date_infection[j]] <-
+        GGDCOVID19BM_pos_Jun20_rec$infect_nr[j] + 1
+      GGDCOVID19BM_pos_Jun20_rec$infect[GGDCOVID19BM_pos_Jun20_rec$RINPERSOON == i &
+        GGDCOVID19BM_pos_Jun20_rec$date_infection >=
+          GGDCOVID19BM_pos_Jun20_rec$date_infection[j]] <-
+        GGDCOVID19BM_pos_Jun20_rec$date_infection[j]
+    }
+  }
+}
+GGDCOVID19BM_pos_Jun20_rec %>% filter(RINPERSOON %in% RINPERSOON[infect_nr > 1]) %>%
+  select(RINPERSOON, date_infection, infect, infect_nr, remove) %>% 
+  mutate(date_infection-infect) %>% print(n=20)
+GGDCOVID19BM_pos_Jun20_rec %>% count(infect_nr)
+
+# keep only relevant rows
+GGDCOVID19BM_pos_Jun20_rec %>% count(remove)
+GGDCOVID19BM_pos_Jun20_rec <- GGDCOVID19BM_pos_Jun20_rec %>% filter(remove == 0)
+nrow(GGDCOVID19BM_pos_Jun20_rec)
+
+# end of acute phase:
+GGDCOVID19BM_pos_Jun20_rec$rec <- GGDCOVID19BM_pos_Jun20_rec$date_infection + 28
+head(GGDCOVID19BM_pos_Jun20_rec %>% select(RINPERSOON,date_infection:rec))
+
+# wide format (needed for multi-state model)
+GGDCOVID19BM_pos_Jun20_rec_w <- GGDCOVID19BM_pos_Jun20_rec %>%
+  pivot_wider(id_cols = RINPERSOON, names_from = infect_nr, values_from = c(infect, rec))
+head(GGDCOVID19BM_pos_Jun20_rec_w %>% arrange(infect_3))  %>% print(width = Inf)
+
+nrow(data_2020_2021)
+data_2020_2021 <- data_2020_2021 %>%
+  left_join(GGDCOVID19BM_pos_Jun20_rec_w, by = "RINPERSOON")
+nrow(data_2020_2021)
+```
+
+# calculate additional variables
+```{r calculate additional variables}
+# interval/status: 
+# intervals are in days, start at 31 Dec 2019
+data_2020_2021 <- data_2020_2021 %>%
+  mutate(
+    entry = as.numeric(start - as.Date("2019-12-31")),
+    entry_s = 1,
+    srv_s = ifelse(!is.na(date_death) & date_death <= stop, 1, 0),
+    srv = ifelse(srv_s == 1,
+      as.numeric(date_death - as.Date("2019-12-31")),
+      as.numeric(stop - as.Date("2019-12-31"))),
+    vacc_s = ifelse(!is.na(date_vaccination) & date_vaccination <= stop,
+      "vaccination", ifelse(srv_s == 1, "death", "censored")),
+    vacc = ifelse(vacc_s == "vaccination",
+                  ifelse(date_vaccination <= start, entry,
+                         as.numeric(date_vaccination - as.Date("2019-12-31"))), srv),
+    # first infection:
+    infectJun_s = ifelse(!is.na(infect_1) & infect_1 <= stop,
+                         "infection", ifelse(srv_s == 1, "death", "censored")),
+    infectJun = ifelse(infectJun_s == "infection",
+                       ifelse(infect_1 <= start, entry, 
+                              as.numeric(infect_1 - as.Date("2019-12-31"))), srv))
+
+# infection episodes (distinguish between before/after vaccination)
+names(data_2020_2021)[grepl("infect_", names(data_2020_2021))]
+# currently max 3 infection episodes
+
+# split infection into before/after start and before/after vaccination
+# for multi-state model, it is not possible to have infection and vaccination at the same time -> set infection one day earlier (as ‘infection’ date is actually the testing date)
+df_infect_vacc <- data_2020_2021 %>%
+  select(RINPERSOON, start, stop, date_vaccination, date_death,
+         infect_1, infect_2, infect_3, rec_1, rec_2, rec_3) %>%
+  pivot_longer(cols = c(contains("infect"), contains("rec")), 
+               names_to = "state", values_to = "time") %>%
+  filter(!is.na(time)) %>%
+  mutate( # set infection one day earlier if at same day as vaccination:
+    time = as.Date(ifelse(!is.na(date_vaccination) & date_vaccination == time, time - 1, time),
+      origin = "1970-01-01"),
+    timing = case_when(
+      time >= date_death & date_death <= stop ~ "after_death",
+      time > stop ~ "after_stop",
+      time > date_vaccination ~ "after_vacc",
+      T ~ "before_vacc")) %>%
+  arrange(RINPERSOON, time)
+head(df_infect_vacc)
+
+table(df_infect_vacc$timing)
+df_infect_vacc %>% filter(timing %in% c("after_death","after_stop")) %>% count(state)
+# remove all recoveries occurring after stop or death
+
+df_infect_vacc2 <- df_infect_vacc %>%
+  filter(!timing %in% c("after_death", "after_stop")) %>% 
+  mutate(state2 = ifelse(grepl("infect", state), "infect", "rec")) %>%
+  group_by(RINPERSOON, timing, state2) %>%
+  mutate(nr = 1, nr = cumsum(nr)) %>%
+  group_by(RINPERSOON) %>%
+  mutate( # what is the first infection/recovery event after vaccination?
+    time1_afterVacc = as.Date(
+      ifelse(timing == "after_vacc",
+        time[time == min(time[timing == "after_vacc"])], NA),
+      origin = "1970-01-01"),
+    state1_afterVacc = ifelse(timing == "after_vacc", state2[time == time1_afterVacc], NA)) %>%
+  ungroup()
+
+df_infect_vacc2 %>%
+  filter(RINPERSOON %in% RINPERSOON[state1_afterVacc == "rec"] &
+    RINPERSOON %in% RINPERSOON[nr > 1 & timing == "after_vacc"]) %>%
+  select(-c(stop, date_death))
+# if from infection to vaccination, person goes to recovery after vaccination without having any infection after vaccination -> remove these states and renumber 
+df_infect_vacc2 %>% filter(!is.na(state1_afterVacc) & state1_afterVacc == "rec" &
+  state2 == "rec" & nr == 1) # remove
+nrow(df_infect_vacc2)
+df_infect_vacc3 <- df_infect_vacc2 %>%
+  filter(!(!is.na(state1_afterVacc) & state1_afterVacc == "rec" & state2 == "rec" & nr == 1)) %>%
+  group_by(RINPERSOON, timing, state2) %>%
+  mutate(nr2 = 1, nr2 = cumsum(nr2)) %>%
+  ungroup()
+nrow(df_infect_vacc3)
+
+# check
+df_infect_vacc3 %>%
+  filter(RINPERSOON %in% RINPERSOON[nr != nr2]) %>%
+  select(RINPERSOON,time,timing,state2,nr:nr2)
+
+# to wide format
+df_infect_vacc_w <- df_infect_vacc3 %>%
+  mutate(state_timing = paste(timing, state2, sep = "_")) %>%
+  pivot_wider(id_cols = c(RINPERSOON, start), 
+              names_from = c(state_timing, nr2), values_from = time)
+df_infect_vacc_w
+
+# back to long format in order to give everyone a status (0 if empty, 1 if value present)
+df_infect_vacc4 <- df_infect_vacc_w %>%
+  pivot_longer(cols = -c(RINPERSOON, start), names_to = "state", values_to = "time") %>%
+  filter(!is.na(time)) %>%
+  mutate(s = 1,
+         int = as.numeric(time - as.Date("2019-12-31")), # from time 0
+         int_start = as.numeric(time - start)) %>% # from entry time
+  group_by(RINPERSOON) %>%
+  mutate( # for those with infection/recovery before start, only keep last event before start (and keep all events after start)
+    max_int0 = ifelse(any(int_start <= 0), max(int_start[int_start <= 0]), 0),
+    remove = ifelse(int_start < max_int0, 1, 0)) %>%
+  ungroup()
+table(df_infect_vacc4$remove)
+
+# to wide format again (no empty cells anymore)
+df_infect_vacc2_w <- df_infect_vacc4 %>%
+  filter(remove == 0) %>%
+  pivot_wider(
+    id_cols = c(RINPERSOON), names_from = state, values_from = c(int, s),
+    names_glue = "{state}_{.value}") %>%
+  left_join(data_2020_2021 %>% select(RINPERSOON, srv), by = "RINPERSOON") %>%
+  mutate(
+    across(ends_with("_int"), ~ ifelse(is.na(.x), srv, .x)),
+    across(ends_with("_s"), ~ ifelse(is.na(.x), 0, .x)))
+df_infect_vacc2_w
+sort(names(df_infect_vacc2_w))
+# after vacc: infect 1-2, rec 1-2
+# before vacc: infect 1-3, rec 1-3
+
+# add to dataset
+data_2020_2021 <- data_2020_2021 %>% left_join(df_infect_vacc2_w %>% select(-srv))
+
+# status variable for infections before start: start_infect_s
+data_2020_2021 <- left_join(data_2020_2021,
+  df_infect_vacc4 %>% filter(int_start <= 0 & remove == 0) %>%
+    select(RINPERSOON, state) %>%
+    rename(start_infect_s = state))
+table(data_2020_2021$start_infect_s, useNA = "ifany")
+# missing if no infection before start
+
+saveRDS(data_2020_2021, "data_2020_2021.rds")
+```

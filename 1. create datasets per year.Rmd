@@ -1,0 +1,189 @@
+---
+title: "create dataset per year"
+output: html_document
+date: "`r Sys.Date()`"
+params:
+  year: 2015
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+library(dplyr)
+library(haven)
+```
+
+```{r files}
+print(params)
+
+# define required file names
+datafiles <- data.frame(
+  year = c(2015, 2016, 2017, 2018, 2019, 2020, 2021),
+  GBASTANDBEVOLKINGTAB = c(
+    "GBASTANDBEVOLKINGTAB 2015V1",
+    "GBASTANDBEVOLKING2016TABV1",
+    "GBASTANDBEVOLKING2017TABV1",
+    "GBASTANDBEVOLKING2018TABV1",
+    "GBASTANDBEVOLKING2019TABV2",
+    "GBASTANDBEVOLKING2020TABV2",
+    "GBASTANDBEVOLKING2021TABV1"),
+  GBAPERSOONTAB = c(
+    "GBAPERSOON2015TABV1",
+    "GBAPERSOONTAB2016V1",
+    "GBAPERSOON2017TABV1",
+    "GBAPERSOON2018TABV2",
+    "GBAPERSOON2019TABV1",
+    "GBAPERSOON2020TABV3",
+    "GBAPERSOON2021TABV1")) %>%
+  mutate(max_birthyear = year - 63)
+```
+
+# create dataset:
+- select all persons that are present in GBAPERSOONTAB
+- select all persons aged >63.0 during that year
+
+```{r GBASTANDBEVOLKINGTAB}
+#### GBASTANDBEVOLKINGTAB for persons + postcode ####
+GBASTANDBEVOLKINGTAB <-
+  read_sav(paste0(
+    "G:/Bevolking/GBASTANDBEVOLKINGTAB/", params$year, "/",
+    datafiles$GBASTANDBEVOLKINGTAB[datafiles$year == params$year], ".sav")) %>%
+  haven::as_factor(only_labelled = T) %>%
+  select(RINPERSOON, GBAPOSTCODE4GAAF1JANUARI)
+dim(GBASTANDBEVOLKINGTAB) # check: identical to population in StatLine?
+```
+
+```{r GBAPERSOONTAB}
+#### GBAPERSOONTAB for sex and birthday ####
+GBAPERSOONTAB <-
+  read_sav(paste0(
+    "G:/Bevolking/GBAPERSOONTAB/", params$year, "/",
+    datafiles$GBAPERSOONTAB[datafiles$year == params$year], ".sav")) %>%
+  haven::as_factor(only_labelled = T) %>%
+  select(RINPERSOON,GBAGESLACHT, GBAGEBOORTEJAAR, GBAGEBOORTEMAAND, GBAGEBOORTEDAG) %>%
+  filter(RINPERSOON %in% GBASTANDBEVOLKINGTAB$RINPERSOON & # persons in GBASTANDBEVOLKINGTAB
+    as.numeric(GBAGEBOORTEJAAR) <= datafiles$max_birthyear[datafiles$year == params$year]) # persons aged >=63 years during this year
+```
+
+```{r start dataset}
+data <- GBAPERSOONTAB %>% # selected population
+  left_join(GBASTANDBEVOLKINGTAB, by = "RINPERSOON") # add personal data
+nrow(data)
+any(duplicated(data$RINPERSOON)) # no
+
+# clean up memory
+rm(GBASTANDBEVOLKINGTAB)
+rm(GBAPERSOONTAB)
+gc()
+
+# create date variable for birthday
+attributes(data$GBAGEBOORTEMAAND)
+data <- data %>%
+  mutate(BIRTHDAY = as.Date(
+    paste(as.numeric(GBAGEBOORTEDAG),
+      as.numeric(GBAGEBOORTEMAAND) - 1,
+      as.numeric(GBAGEBOORTEJAAR),
+      sep = "-"),
+    format = "%d-%m-%Y"))
+head(data) %>% print(width = Inf) # OK
+```
+
+```{r GBAOVERLIJDENTAB}
+#### GBAOVERLIJDENTAB for date of death ####
+GBAOVERLIJDENTAB <-
+  read_sav("G:/Bevolking/GBAOVERLIJDENTAB/2023/GBAOVERLIJDEN2023TABV1.sav") %>%
+  # latest version: also contains information of earlier years
+  filter(RINPERSOON %in% data$RINPERSOON) %>%
+  haven::as_factor(only_labelled = T)
+head(GBAOVERLIJDENTAB)
+
+# add to dataset
+data <- data %>%
+  left_join(GBAOVERLIJDENTAB %>% select(-RINPERSOONS))
+# create date variable for date of death
+data <- data %>%
+  mutate(date_death = as.Date(
+    paste(substr(GBADatumOverlijden, 1, 4),
+      substr(GBADatumOverlijden, 5, 6),
+      substr(GBADatumOverlijden, 7, 8),
+      sep = "-"),
+    format = "%Y-%m-%d"))
+head(data %>% select(GBADatumOverlijden, date_death) %>% filter(!is.na(GBADatumOverlijden))) # OK
+
+rm(GBAOVERLIJDENTAB)
+gc()
+```
+
+```{r follow-up}
+#### add start and stop of follow-up (no information on exact immigration/emigration dates) ####
+# start: 31 Dec of the year before (so that 1 January becomes time 1)
+# stop: 31 Dec or death
+
+# start:
+data <- data %>%
+  mutate(
+    birthday_63 = as.Date(paste(as.numeric(substr(as.character(BIRTHDAY), 1, 4)) + 63,
+      as.numeric(substr(as.character(BIRTHDAY), 6, 7)),
+      as.numeric(substr(as.character(BIRTHDAY), 9, 10)),
+      sep = "-")),
+    start = as.Date(paste0(params$year, "-01-01"), origin = "1970-01-01") - 1)
+
+# stop:
+data <- data %>%
+  mutate(stop = as.Date( 
+    ifelse(!is.na(date_death) &
+      date_death < as.Date(paste0(params$year, "-12-31")),
+    date_death, as.Date(paste0(params$year, "-12-31"))),
+    origin = "1970-01-01"))
+
+# check rows where start == stop
+data %>%
+  filter(start == stop) %>%
+  select(birthday_63, start, stop, date_death, GBAPOSTCODE4GAAF1JANUARI) %>%
+  unique() %>%
+  mutate(
+    diff_birthday_63 = date_death - birthday_63,
+    diff_start = date_death - as.Date(paste0(params$year, "-01-01")))
+# death on start:  happens with some who die 1 day before becoming 63 or on 31 December of the year before, will be removed later
+
+# check start after stop:
+data %>%
+  filter(start > stop) %>%
+  mutate(age_death = as.numeric((date_death - BIRTHDAY) / 365.241)) %>%
+  select(start, stop, birthday_63, date_death, GBAPOSTCODE4GAAF1JANUARI, age_death)
+data %>%
+  filter(start > stop) %>%
+  mutate(age_death = as.numeric((date_death - BIRTHDAY) / 365.241)) %>%
+  select(start, stop, birthday_63, date_death, GBAPOSTCODE4GAAF1JANUARI, age_death) %>%
+  filter(is.na(age_death) | (!is.na(age_death) & age_death >= 63))
+# died before reaching 63 or occurs because of migration(?) -> remove
+
+nrow(data)
+data <- data %>% filter(start < stop)
+nrow(data)
+```
+
+```{r calculate additional variables}
+# age at start of year
+data <- data %>%
+  mutate(age_1Jan = as.numeric(as.Date(paste0(params$year, "-01-01")) - BIRTHDAY) / 365.241)
+
+# interval/status
+data <- data %>% # intervals are in days, start at 31 Dec of previous year
+  mutate(
+    entry = as.numeric(start - (as.Date(paste0(params$year, "-01-01")) - 1)),
+    entry_s = 1,
+    srv_s = ifelse(!is.na(date_death) & date_death <= stop, 1, 0),
+    srv = ifelse(srv_s == 1, as.numeric(date_death - (as.Date(paste0(params$year, "-01-01")) - 1)),
+      ifelse(params$year %in% c(2016, 2020), 366, 365))) # leap and non-leap years
+
+range(data$entry)
+range(data$srv)
+
+nrow(data)
+saveRDS(data, paste0("data_", params$year, ".rds"))
+```

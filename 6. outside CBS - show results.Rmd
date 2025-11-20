@@ -1,0 +1,2591 @@
+---
+title: "calculations and results outside CBS environment"
+output: 
+  html_document:
+    keep_md: true
+    toc: true
+    toc_float: true
+date: "`r Sys.Date()`"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This syntax uses the .xlsx files exported from CBS to reconstruct all required objects that had been calculated in "analyses - calculations". The .xlsx file made by "export results from CBS" had been split into multiple files as it was too big to export in one go. Outside CBS the different .xlsx files have been merged again to a single .xlsx file called export_rebuilt.xlsx.
+The figures made by this syntax are saved in a folder called "figures".
+
+```{r packages}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(mstate)
+library(relsurv)
+library(ggplot2)
+library(ggh4x)
+library(grid)
+library(gridExtra)
+library(gtable)
+library(reshape2)
+library(forcats)
+```
+
+```{r functions}
+### calculate mstate objects ####
+# steps to reconstruct all msfit objects based on the exported .xslsx file, calculate probtrans objects and save everything
+func_prob <- function(workbook = "export_rebuilt.xlsx"){
+
+  ratetables <- c("nedpop_months", "nedpop2", "nedpop_1519", "nedpop_year")
+  
+  for (mm in c("surv", "mstate", "birthcohorts")){
+    message(paste0(" ", mm))
+    
+    if (!(m == "observed" & mm == "birthcohorts")){
+      
+      # reconstruct transition matrix from state 1 & time 0 (same for all subsets if no landmarking)
+      df_trans <- read_xlsx(workbook, "transitions")  %>% 
+        filter(name == "total" & model == ifelse(mm == "surv", "surv", "mstate") & 
+                 type == m & start == 0 & start_state %in% c("alive", "alive event-free")) %>%
+        select(transno:transname)
+      trans_names <- df_trans %>% pivot_longer(c(from,to),names_to = "type", values_to = "nr") %>%
+        pivot_longer(c(fromname,toname),names_to = "type_name", values_to = "name") %>%
+        mutate(type_name = gsub("name","",type_name)) %>% 
+        filter(type==type_name) %>% select(nr,name) %>% unique()%>%arrange(nr) %>% 
+        pull(name)
+      trans <- matrix(F, max(c(df_trans$from, df_trans$to)), max(c(df_trans$from, df_trans$to)))
+      for (j in 1:nrow(df_trans)){
+        trans[df_trans$from[j], df_trans$to[j]] <- T
+      }
+      trans <- tra2trans(trans)
+      rownames(trans) <- trans_names
+      colnames(trans) <- trans_names
+      
+      for (ratetable in ratetables){
+        message(paste0("  ", ratetable))
+        if (!(mm == "birthcohorts" & ratetable != "nedpop_months")){
+          sheetname = ifelse(m == "observed", "", paste0("_",ratetable))
+          
+          if (mm == "birthcohorts"){
+            names_total = c("<1931", "1931-1935", "1936-1940", "1941-1946", "1947-1951", "1952", "1953-1955", "1956")
+          } else {
+            names_total = c("male <65", "male 65-69", "male 70-79", "male 80-89", "male 90+", 
+                            "female <65", "female 65-69", "female 70-79", "female 80-89", "female 90+",
+                            "total")
+          }
+          
+          # reconstruct haz sheets
+          sheet_haz <- read_xlsx(workbook, paste0(mm, "_Haz", sheetname)) %>%
+            pivot_longer(-time, names_to = c("name", "start", "from", "trans"),
+                         names_pattern = "(.*)_(.*)_(.*)_(.*)", values_to = "Haz") %>%
+            filter(!is.na(Haz)) %>%
+            mutate(across(c(start, trans), ~as.numeric(.x))) %>%
+            left_join(read_xlsx(workbook, "transitions") %>%
+                        filter(model == ifelse(mm == "surv", "surv", "mstate")) %>%
+                        select(transno,transname:start_state),
+                      by = c("trans"="transno", "name"="name", "start"="start",
+                             "from"="start_state")) %>%
+            mutate(combi = gsub("\\.e|\\.p", "", transname))
+          
+          if (mm != "birthcohorts" & ratetable == "nedpop_months") {
+            sheet_months <- sheet_haz %>% 
+              group_by(time, name, start, from, trans, combi) %>%
+              mutate(sumHaz = sum(Haz)) %>% ungroup()
+          } else if (grepl("nedpop2|nedpop_1519|nedpop_year", sheetname)){
+            sheet_haz <- sheet_haz %>%
+              full_join(sheet_months %>% filter(!transname %in% sheet_haz$transname) %>%
+                          select(time:trans, transname, combi, sumHaz)) %>%
+              group_by(time, name, start, from, combi) %>%
+              mutate(sumHaz = ifelse(is.na(sumHaz), sum(sumHaz, na.rm = T), sumHaz), 
+                     Haz = ifelse(is.na(Haz), sumHaz - sum(Haz, na.rm = T), Haz)) %>%
+              ungroup()
+          }
+          
+          sheet_haz <- sheet_haz %>% 
+            full_join(expand.grid(time = 1:max(sheet_haz$time, na.rm = T),
+                                  name = unique(sheet_haz$name), 
+                                  start = unique(sheet_haz$start),
+                                  from = unique(sheet_haz$from),
+                                  trans = unique(sheet_haz$trans)), 
+                      by = c("time", "name", "start", "from", "trans"),
+                      relationship = "many-to-many") %>%
+            arrange(name, start, from, trans, time) %>%
+            mutate(Haz = ifelse(time ==1 & is.na(Haz), 0, Haz)) %>%
+            group_by(name, start, from, trans) %>%
+            filter(time <= max(time) - start) %>%
+            fill(Haz, .direction = "down") %>% 
+            filter(sum(Haz) != 0) %>% ungroup()
+          
+          # reconstruct varHaz sheets
+          if (ratetable == "nedpop_months") {
+            sheet_varHaz <- read_xlsx(workbook, 
+                                      ifelse(mm == "birthcohorts", "birthcohorts_varHaz",
+                                             paste0(mm, "_varHaz_nedpop_months"))) %>%
+              pivot_longer(-time, names_to = c("name", "start", "from", "trans1", "trans2"),
+                           names_pattern = "(.*)_(.*)_(.*)_(.*)_(.*)",
+                           values_to = "varHaz") %>%
+              filter(!is.na(varHaz)) %>%
+              mutate(across(c(start, trans1, trans2), ~as.numeric(.x)))
+          
+            sheet_varHaz <- sheet_varHaz %>% 
+              full_join(expand.grid(time = 1:max(sheet_varHaz$time),
+                                    name = unique(sheet_varHaz$name),
+                                    start = unique(sheet_varHaz$start),
+                                    from = unique(sheet_varHaz$from),
+                                    trans1 = 1:max(sheet_varHaz$trans1),
+                                    trans2 = 1:max(sheet_varHaz$trans2)) %>%
+                          filter(trans1>=trans2), 
+                        by = c("time", "name", "start", "from", "trans1", "trans2"),
+                        relationship = "many-to-many") %>%
+              arrange(name, start, from, trans1, trans2, time) %>%
+              mutate(varHaz = ifelse(time ==1 & is.na(varHaz), 0, varHaz)) %>%
+              group_by(start) %>%
+              mutate(maxTime = max(time)) %>%
+              group_by(name, start, from, trans1, trans2) %>%
+              filter(time <= maxTime - start) %>%
+              fill(varHaz, .direction = "down") %>% 
+              ungroup()
+            
+            sheet_months_varHaz = sheet_varHaz
+          } else {
+            sheet_varHaz = sheet_months_varHaz
+          }
+          
+          for (i in names_total){
+            message(paste0("   ", i))
+            
+            #### no landmarking ####
+            message(paste0("    ", "no landmarking"))
+            list_export <- vector("list", 2)
+            names(list_export) <- c("haz", "prob")
+            if (mm == "surv"){
+              time = 1:731
+            } else {
+              time = 1:579
+            }
+          
+            # reconstruct msfit object
+            list_export$haz <- list(
+              Haz = sheet_haz %>% 
+                filter(from %in% c("alive", "alive event-free") & start == 0 & name == i) %>%
+                select(time, trans, Haz) %>% 
+                select(time, trans, Haz),
+              varHaz = sheet_varHaz %>%
+                filter(from %in% c("alive", "alive event-free") & start == 0 & name == i) %>%
+                select(time, trans1, trans2, varHaz),
+              trans = trans
+              )
+            class(list_export$haz) <- "msfit"
+            
+            # calculate probtrans objects: only from time 0; other landmark times via landmarking
+            if (mm == "surv" | (mm != "surv" & ratetable != "nedpop_months")){
+              times = 0
+            } else {
+              times = c(0, 214, 365, 457, 548)
+            }
+            
+            list_export$prob <- vector("list", length(times))
+            names(list_export$prob) <- paste0("time", times)
+            for (t in times){
+              list_export$prob[[paste0("time", t)]] <- 
+                probtrans(list_export$haz, predt = t, method = "greenwood", covariance = T)
+            }
+            
+            # save objects
+            saveRDS(list_export, 
+                    paste0("export_", ifelse(m == "observed", "", 
+                                             paste0("relsurv_", ratetable, "_")),
+                           gsub(" |-", "_", gsub("<1931", "before1931", gsub("<65", "63-64", gsub("\\+", "plus",i)))), ifelse(mm == "surv", "_srv", ""), ".rds"))
+            rm(list_export)
+            
+            #### with landmarking ####
+            if (mm != "birthcohorts" & !(mm == "mstate" & ratetable != "nedpop_months")){
+              message(paste0("    ", "landmarking"))
+              if (mm == "surv"){
+                times = c(152, 366)
+                from = "alive"
+              } else {
+                times = c(214, 365, 457, 548)
+                from =c("alive event-free", "vaccination", "recent infection",
+                        "recent infection after vaccination", "non-recent infection",
+                        "vaccination after infection", "non-recent infection after vaccination")
+              }
+              
+              LMlist <- vector("list", length = length(times))
+              names(LMlist) <- paste0("time", times)
+            
+              for (t in times) {
+                store <- vector("list", length(from))
+                names(store) <- from
+                for (fr in from){
+                  counts <- read_xlsx(workbook, paste0(mm, "_counts")) %>%
+                    filter(start == t & state == fr)
+                  if (i == "total"){
+                    n <- ifelse(nrow(counts) == 0, 0, sum(counts$n, na.rm = T))
+                  } else {
+                    n <- ifelse(nrow(counts[counts$sex_age == i,]) == 0, 0, 
+                                counts$n[counts$sex_age == i])
+                  }
+                  if (!is.na(n) & n >= 40) { 
+                    # if <40 persons, don't calculate msfit/probtrans; numbers <10 are NA in excel due to export rules of CBS
+                    
+                    # reconstruct transition matrix from state 1 & time 0 
+                    df_trans2 <- read_xlsx(workbook, "transitions") %>%
+                      filter(name == i & model == ifelse(mm == "surv", "surv", "mstate") & 
+                               type == m & start == t & start_state == fr) %>%
+                      select(transno:transname)
+                    trans_names2 <- df_trans2 %>% 
+                      pivot_longer(c(from,to), names_to = "type", values_to = "nr") %>%
+                      pivot_longer(c(fromname, toname), names_to = "type_name", values_to = "name") %>%
+                      mutate(type_name = gsub("name", "", type_name)) %>% 
+                      filter(type == type_name) %>% select(nr, name) %>% unique() %>% arrange(nr) %>% 
+                      pull(name)
+                    trans2 <- matrix(F, max(c(df_trans2$from, df_trans2$to)),
+                                     max(c(df_trans2$from, df_trans2$to)))
+                    for (j in 1:nrow(df_trans2)){
+                      trans2[df_trans2$from[j], df_trans2$to[j]] <- T
+                    }
+                    trans2 <- tra2trans(trans2)
+                    rownames(trans2) <- trans_names2
+                    colnames(trans2) <- trans_names2
+                    
+                    from_old_name = fr 
+                    from_new = which(rownames(trans2) == from_old_name)
+                    
+                    # reconstruct msfit objects
+                    temp_haz <- list(
+                      Haz = sheet_haz %>% 
+                        filter(from == fr & start == t & name == i) %>%
+                        select(time, trans, Haz), 
+                      varHaz = sheet_varHaz %>% 
+                        filter(from == fr & start == t & name == i) %>%
+                        select(time, trans1, trans2, varHaz),
+                      trans = trans2
+                      )
+                    class(temp_haz) <- "msfit"
+                    
+                    # calculate probtrans objects
+                    temp_prob <- 
+                      probtrans(temp_haz, predt = 0, method = "greenwood", covariance = T)
+                    
+                    store[[fr]] <- 
+                      list(t, n, temp_haz, temp_prob, fr, from_new, from_old_name)
+                    names(store[[fr]]) <-
+                      c("LM", "n", ifelse(m == "observed", "msf", "mod"), "prob", 
+                        "from_old", "from_new", "from_old_name")
+                  } else { # in case not enough persons at risk
+                  store[[fr]] <- list(t, n, from_old_name)
+                  names(store[[fr]]) <- c("LM", "n", "from_old_name")
+                  }
+                  LMlist[[paste0("time", t)]] <- store
+                }
+              }
+              
+              # save objects
+              saveRDS(
+                  LMlist,
+                  paste0("export_", ifelse(m == "observed", "",
+                                           paste0("relsurv_", ratetable, "_")),
+                         gsub(" |-", "_", gsub("<65", "63-64", gsub("\\+", "plus",i))), ifelse(mm == "surv", "_srv", ""), "_LM.rds"))
+              rm(LMlist)
+              
+            }
+          }
+          rm(sheet_haz)
+          rm(sheet_varHaz)
+        }
+      } 
+    }
+  }
+}
+
+### add_paths ####
+# used for plotting the model structure behind the plot_mstate() panels
+triangle_below <- ggplotGrob(
+  ggplot() +
+    annotate("polygon",
+      x = c(1, 2, 3), y = c(2, 1, 2),
+      fill = "grey90", color = "grey50", alpha = 0.5
+    ) +
+    theme_void() +
+    coord_cartesian(expand = 0)
+)
+triangle_up <- ggplotGrob(
+  ggplot() +
+    annotate("polygon",
+      x = c(1, 2, 3), y = c(1, 2, 1),
+      fill = "grey90", color = "grey50", alpha = 0.5
+    ) +
+    theme_void() +
+    coord_cartesian(expand = 0)
+)
+triangle_right <- ggplotGrob(
+  ggplot() +
+    annotate("polygon",
+      x = c(1, 2, 1), y = c(1, 2, 3),
+      fill = "grey90", color = "grey50", alpha = 0.5
+    ) +
+    theme_void() +
+    coord_cartesian(expand = 0)
+)
+triangle_left <- ggplotGrob(
+  ggplot() +
+    annotate("polygon",
+      x = c(2, 1, 2), y = c(1, 2, 3),
+      fill = "grey90", color = "grey50", alpha = 0.5
+    ) +
+    theme_void() +
+    coord_cartesian(expand = 0)
+)
+triangle_rightup <- ggplotGrob(
+  ggplot() +
+    annotate("polygon",
+      x = c(1, 2, 1), y = c(3.2, 4, 1),
+      fill = "grey90", color = "grey50", alpha = 0.5
+    ) +
+    theme_void() +
+    coord_cartesian(expand = 0)
+)
+triangle_rightlow <- ggplotGrob(
+  ggplot() +
+    annotate("polygon",
+      x = c(1, 2, 1), y = c(1.8, -0.4, 4),
+      fill = "grey90", color = "grey50", alpha = 0.5
+    ) +
+    annotate("point", x = 1, y = -1.9, fill = "transparent", color = "transparent") +
+    theme_void() +
+    coord_cartesian(expand = 0)
+)
+triangle_rightlow2 <- ggplotGrob(
+  ggplot() +
+    annotate("polygon",
+      x = c(1, 2, 1), y = c(2, -0.4, 4),
+      fill = "grey90", color = "grey50", alpha = 0.5
+    ) +
+    annotate("point", x = 1, y = -2.3, fill = "transparent", color = "transparent") +
+    theme_void() +
+    coord_cartesian(expand = 0)
+)
+triangle_rightlow3 <- ggplotGrob(
+  ggplot() +
+    annotate("polygon",
+      x = c(1, 2, 1), y = c(2, -0.4, 4),
+      fill = "grey90", color = "grey50", alpha = 0.5
+    ) +
+    annotate("point", x = 1, y = -2.3, fill = "transparent", color = "transparent") +
+    theme_void() +
+    coord_cartesian(expand = 0)
+)
+triangle_rightlowlow <- ggplotGrob(
+  ggplot() +
+    annotate("polygon",
+      x = c(1, 2, 1), y = c(2.7, -0.9, 4),
+      fill = "grey90", color = "grey50", alpha = 0.5
+    ) +
+    annotate("point", x = 1, y = -1.9, fill = "transparent", color = "transparent") +
+    theme_void() +
+    coord_cartesian(expand = 0)
+)
+triangle_leftup <- ggplotGrob(
+  ggplot() +
+    annotate("polygon",
+      x = c(2, 1, 2), y = c(1.6, 4, -0.4),
+      fill = "grey90", color = "grey50", alpha = 0.5
+    ) +
+    annotate("point", x = 1, y = 5.6, fill = "transparent", color = "transparent") +
+    theme_void() +
+    coord_cartesian(expand = 0)
+)
+
+add_paths <- function(grob = last_plot()) {
+  grob <- ggplotGrob(grob)
+  grob.2 <- gtable_add_grob(grob, triangle_up, t = 12, l = 7, b = 13, r = 8, z = 0) # alive -> death
+  grob.2 <- gtable_add_grob(grob.2, triangle_right, t = 15, l = 8, b = 16, r = 10, z = 0) # alive -> vacc
+  grob.2 <- gtable_add_grob(grob.2, triangle_rightlow, t = 15, l = 8, b = 23, r = 10, z = 0) # alive -> infect
+  grob.2 <- gtable_add_grob(grob.2, triangle_right, t = 15, l = 13, b = 16, r = 14, z = 0) # vacc -> infect
+  grob.2 <- gtable_add_grob(grob.2, triangle_up, t = 12, l = 11, b = 13, r = 12, z = 0) # vacc -> death
+  grob.2 <- gtable_add_grob(grob.2, triangle_below, t = 22, l = 11, b = 23, r = 12, z = 0) # infect -> death
+  grob.2 <- gtable_add_grob(grob.2, triangle_right, t = 21, l = 12, b = 20, r = 14, z = 0) # infect -> vacc
+  grob.2 <- gtable_add_grob(grob.2, triangle_rightlow2, t = 20, l = 13, b = 30, r = 14, z = 0) # infect -> non-recent infect
+  grob.2 <- gtable_add_grob(grob.2, triangle_up, t = 12, l = 15, b = 13, r = 15, z = 0) # infect_vacc -> death
+  grob.2 <- gtable_add_grob(grob.2, triangle_right, t = 15, l = 16, b = 16, r = 18, z = 0) # infect_vacc -> non-recent infect_vacc
+  grob.2 <- gtable_add_grob(grob.2, triangle_up, t = 16, l = 15, b = 17, r = 15, z = 0) # vacc_infect -> infect_vacc
+  grob.2 <- gtable_add_grob(grob.2, triangle_right, t = 20, l = 16, b = 20, r = 18, z = 0) # vacc_infect -> death
+  grob.2 <- gtable_add_grob(grob.2, triangle_up, t = 21, l = 15, b = 23, r = 16, z = 0) # non-recent infect -> vacc_infect
+  grob.2 <- gtable_add_grob(grob.2, triangle_right, t = 25, l = 16, b = 25, r = 18, z = 0) # non-recent infect -> death
+  grob.2 <- gtable_add_grob(grob.2, triangle_leftup, t = 18, l = 13, b = 25, r = 14, z = 0) # non-recent infect -> recent infect
+  grob.2 <- gtable_add_grob(grob.2, triangle_left, t = 15, l = 18, b = 16, r = 16, z = 0) # non-recent infect_vacc <- infect_vacc
+  grob.2 <- gtable_add_grob(grob.2, triangle_up, t = 12, l = 19, b = 13, r = 20, z = 0) # non-recent infect_vacc -> death
+  return(grid.arrange(grob.2))
+}
+
+# structure for landmark plots from 'recent infection'
+add_paths2 <- function(grob = last_plot()) {
+  grob <- ggplotGrob(grob)
+  grob.2 <- gtable_add_grob(grob, triangle_below, t = 10, l = 5, b = 11, r = 6, z = 0) # infec -> death
+  grob.2 <- gtable_add_grob(grob.2, triangle_right, t = 8, l = 6, b = 8, r = 8, z = 0) # infect -> non-recent infect
+  grob.2 <- gtable_add_grob(grob.2, triangle_rightlow, t = 8, l = 6, b = 13, r = 8, z = 0) # infect -> non-recent infect
+  grob.2 <- gtable_add_grob(grob.2, triangle_below, t = 10, l = 9, b = 11, r = 10, z = 0) #  non-recent infect -> vacc
+  grob.2 <- gtable_add_grob(grob.2, triangle_right, t = 8, l = 10, b = 8, r = 12, z = 0) #  non-recent infect -> death
+  grob.2 <- gtable_add_grob(grob.2, triangle_left, t = 8, l = 8, b = 8, r = 6, z = 0) # non-recent infect -> infect
+  grob.2 <- gtable_add_grob(grob.2, triangle_below, t = 14, l = 9, b = 15, r = 10, z = 0) #  vacc -> infect_vacc
+  grob.2 <- gtable_add_grob(grob.2, triangle_below, t = 19, l = 9, b = 21, r = 10, z = 0) # infect_vacc -> death
+  grob.2 <- gtable_add_grob(grob.2, triangle_right, t = 13, l = 10, b = 13, r = 12, z = 0) # infect_vacc -> non-recent infect_vacc
+  grob.2 <- gtable_add_grob(grob.2, triangle_left, t = 18, l = 12, b = 18, r = 10, z = 0) # infect_vacc -> non-recent infect_vacc
+  grob.2 <- gtable_add_grob(grob.2, triangle_right, t = 18, l = 10, b = 18, r = 12, z = 0) # non-recent infect_vacc -> infect_vacc
+  grob.2 <- gtable_add_grob(grob.2, triangle_below, t = 19, l = 13, b = 21, r = 13, z = 0) # non-recent infect_vacc -> death
+  return(grid.arrange(grob.2))
+}
+
+##### prep_probtrans_df from mstate package with small changes (see comments starting with CHANGE) #####
+# Helper function to prep data for plotting 
+prep_probtrans_df <- function(obj,
+                              from,
+                              ord,
+                              state_names
+                              ) {
+  
+  # For R cmd check
+  . <- state_num <- state <- se_state <- prob <- se <- cum_probs <-  NULL
+  
+  # Read in probtrans object
+  df <- data.table::data.table(obj[[from]])
+  
+  # Subset states with at least one non zero probability
+  zero_prob_cols <- apply(df, 2, function(col) !all(col == 0))
+  
+  # Condition pstate cols
+  pstate_cols <- grepl(x = names(df), pattern = "pstate|time")
+  condition_pstate <- zero_prob_cols & pstate_cols  
+
+  # Prepare 
+  df_pstate <- data.table::melt.data.table(
+    data = df[time != Inf, .SD, .SDcols = condition_pstate],
+    id.vars = "time",
+    variable.name = "state",
+    value.name = "prob"
+  ) 
+  df_pstate[, state_num := as.numeric(gsub(x = state, pattern = "pstate", replacement = ""))]
+  df_long <- df_pstate
+
+  # Check if standard errors were computed (only time)
+  se_cols <- grepl(x = names(df), pattern = "se|time")
+  if (sum(se_cols) > 1) {
+    condition_se <- zero_prob_cols & se_cols
+    
+    # Se's long
+    df_se <- data.table::melt.data.table(
+      data = df[time != Inf, .SD, .SDcols = condition_se],
+      id.vars = "time",
+      variable.name = "se_state",
+      value.name = "se"
+    ) 
+    df_se[, state_num := as.numeric(gsub(x = se_state, pattern = "se", replacement = ""))]
+    
+    # Put se's and pstates together
+    df_long <- data.table::merge.data.table(
+      x = df_pstate, 
+      y = df_se, 
+      by = c("time", "state_num")
+    )
+    
+    # CHANGE: these lines were inactivated (calculate CIs later)
+    # # Add CI for probabilities, do this on log
+    # df_long[, ':=' (
+    #   CI_low = make_prob_confint(prob, se, conf.type, conf.int, bound = "low"),
+    #   CI_upp = make_prob_confint(prob, se, conf.type, conf.int, bound = "upp")
+    # )]  #, by = .(time, state)] %>% 
+  }
+  
+  # Order and label factor with state names
+  df_long[, state := factor(
+    x = state_num, 
+    levels = ord, 
+    labels = state_names[ord]
+  )]
+  
+  data.table::setorder(df_long, time, state)
+  df_long[, cum_probs := cumsum(prob), by = time]
+  
+  # Compute upper and lower bounds of ribbons
+  df_long[, ':=' (
+    low = c(0, cum_probs[-length(cum_probs)]),
+    upp = c(cum_probs[-length(cum_probs)], 1)
+  ), by = time] 
+  
+  # Df with steps for ribbon
+  df_steps <- rbind(df_long, df_long) 
+  data.table::setorder(df_steps, time)
+    
+  # Shift time by 1, creating steps, equi to dplyr::lead(time, n = 1)
+  df_steps[, time := data.table::shift(
+    x = time, 
+    fill = NA, 
+    n = 1, 
+    type = "lead"
+  ), by = state] 
+ 
+  return(df_steps[!is.na(time)]) 
+}
+
+### summarise and plot msfit or probtrans data ####
+plot_data <- function(data, levels = NA, state_levels = NA, estimate = c("probtrans", "hazards"),
+                      conf.type = "plain", conf.int = 0.95, 
+                      from = NA, 
+                      start = 0,
+                      combine_relsurv = T, hide_BackgroundMort = F,
+                      only_ExecssMort = F, sum_aliveMort = F, sum_aliveMort_perState = F, sum_perPhase = F, LM_data = F) {
+  if (all(is.na(from))){
+    from = ifelse(any(grepl("srv", deparse(substitute(data)))), "alive", "alive event-free")
+    message(paste("from:", from))
+  }
+  if (class(data) == "list" & !"prob" %in% names(data ) & 
+      any(!is.na(levels)) & length(data) != length(levels)) {
+    stop("data and levels for names have different lengths")
+  }
+  if (conf.type != "plain") {
+    stop("confidence intervals only possible for plain type")
+  }
+  if ("prob" %in% names(data)) {
+    data <- list("total" = data)
+    LM_data <- F
+  } else if (any(grepl("time", names(data)))) {
+    data <- list("total" = data)
+    LM_data <- T
+  }
+  if (estimate == "probtrans") { # get probabilities
+    plot_df <- data.frame()
+    df_variance2 <- data.frame(
+      time = numeric(), variance = numeric(), type = character(),
+      start = numeric(), state2 = character()
+    )
+    for (i in names(data)) {
+      for (t in start) {
+        for (j in from) {
+          from2 = which(rownames(data[[i]]$haz$trans) == j)
+          if ((sum_aliveMort == T | sum_perPhase == T) & # get variance for combined states
+            (LM_data == F |
+              "prob" %in% names(data[[i]][[paste0("time", t)]][[j]]))) {
+            if (LM_data == F) {
+              state_names <- data.frame(
+                state = rownames(data[[i]][["prob"]][[paste0("time", t)]]$trans)
+              ) %>%
+                mutate(
+                  state_no = 1, state_no = cumsum(state_no),
+                  type = case_when(
+                    grepl("\\.e", state) ~ "excess",
+                    grepl("\\.p", state) ~ "background",
+                    T ~ "observed"
+                  ),
+                  state2 = gsub("\\.e|\\.p", "", state)
+                )
+            } else if (is.null(data[[i]][[paste0("time", t)]][[j]]$prob)) {
+              message(paste(
+              "too small at risk set for time", t, "from",
+              j, data[[i]][[paste0("time", t)]][[j]]$from_name,
+              "n < 10"))
+            } else {
+              state_names <- data.frame(
+                state = rownames(
+                  data[[i]][[paste0("time", t)]][[j]]$prob$trans
+                )
+              ) %>%
+                mutate(
+                  state_no = 1, state_no = cumsum(state_no),
+                  type = case_when(
+                    grepl("\\.e", state) ~ "excess",
+                    grepl("\\.p", state) ~ "background",
+                    T ~ "observed"
+                  ),
+                  state2 = gsub("\\.e|\\.p", "", state)
+                )
+              if (sum_perPhase == T){
+                state_names <- state_names %>%
+                  mutate(state2 = case_when(state %in% c("alive event-free","vaccination") ~ "alive", 
+                                            T ~ state),
+                         state2 = gsub(" \\.", "\\.", gsub(" after vaccination|after vaccination|event-free", "", 
+                                                           gsub("vaccination after infection", "non-recent infection",state2))))
+                         
+              }
+            }
+            if (sum_aliveMort_perState == F & sum_perPhase == F){
+              for (k in c("excess", "background", "observed")) {
+                state_no <- state_names$state_no[state_names$type == k]
+                df_cov <- data.frame(row = character(), col = character())
+                for (l in state_no) {
+                  state_nos <- state_no[state_no >= l]
+                  df_cov <- df_cov %>% rbind(data.frame(
+                    row = rep(paste0(
+                      "from",
+                      ifelse(LM_data == F, from2,
+                        data[[i]][[paste0("time", t)]][[j]]$from_new
+                      ),
+                      "to", l
+                    ), length(state_nos)),
+                    col = paste0(
+                      "from", ifelse(LM_data == F, from2,
+                        data[[i]][[paste0("time", t)]][[j]]$from_new
+                      ),
+                      "to", state_nos
+                    )
+                  ))
+                }
+                df_cov$mult <- ifelse(df_cov$row == df_cov$col, 1, 2)
+                df_cov$type <- k
+                if (LM_data == F) {
+                  df_variance <- melt(data[[i]][["prob"]][[paste0("time", t)]]$varMatrix)
+                } else {
+                  df_variance <-
+                    melt(data[[i]][[paste0("time", t)]][[j]]$prob$varMatrix)
+                }
+                df_variance <- df_variance %>%
+                  left_join(df_cov, by = c("Var1" = "row", "Var2" = "col")) %>%
+                  filter(!is.na(mult)) %>%
+                  mutate(val = value * mult) %>%
+                  group_by(Var3) %>%
+                  summarise(variance = sum(val), .groups = "drop") %>%
+                  rename(time = Var3) %>%
+                  mutate(
+                    type = k,
+                    from = j,
+                    name = i,
+                    start = t
+                  )
+                df_variance2 <- df_variance2 %>% rbind(df_variance)
+              }
+            } else {
+              for (k in unique(state_names$state2)) {
+                state_no <- state_names$state_no[state_names$state2 == k]
+                df_cov <- data.frame(row = character(), col = character())
+                for (l in state_no) {
+                  state_nos <- state_no[state_no >= l]
+                  df_cov <- df_cov %>% rbind(data.frame(
+                    row = rep(paste0(
+                      "from",
+                      ifelse(LM_data == F, from2,
+                        data[[i]][[paste0("time", t)]][[j]]$from_new
+                      ),
+                      "to", l
+                    ), length(state_nos)),
+                    col = paste0(
+                      "from", ifelse(LM_data == F, from2,
+                        data[[i]][[paste0("time", t)]][[j]]$from_new
+                      ),
+                      "to", state_nos
+                    )
+                  ))
+                }
+                df_cov$mult <- ifelse(df_cov$row == df_cov$col, 1, 2)
+                df_cov$state2 <- k
+                if (LM_data == F) {
+                  df_variance <- melt(data[[i]][["prob"]][[paste0("time", t)]]$varMatrix)
+                } else {
+                  df_variance <-
+                    melt(data[[i]][[paste0("time", t)]][[j]]$prob$varMatrix)
+                }
+                df_variance <- df_variance %>%
+                  left_join(df_cov, by = c("Var1" = "row", "Var2" = "col")) %>%
+                  filter(!is.na(mult)) %>%
+                  mutate(val = value * mult) %>%
+                  group_by(Var3) %>%
+                  summarise(variance = sum(val), .groups = "drop") %>%
+                  rename(time = Var3) %>%
+                  mutate(
+                    state2 = k,
+                    from = j,
+                    name = i,
+                    start = t
+                  )
+                df_variance2 <- df_variance2 %>% rbind(df_variance)
+              }
+            }
+          }
+          if (LM_data == F) {
+            if (!is.na(state_levels[1])) {
+              order <- match(
+                state_levels,
+                rownames(data[[i]][["prob"]][[paste0("time", t)]]$trans)
+              )
+            } else {
+              order <- 1:nrow(data[[i]][["prob"]][[paste0("time", t)]]$trans)
+            }
+            plot_df <- plot_df %>%
+              bind_rows(
+                prep_probtrans_df(data[[i]][["prob"]][[paste0("time", t)]],
+                  ord = order,
+                  from = from2,
+                  state_names = rownames(data[[i]][["prob"]][[paste0("time", t)]]$trans)
+                ) %>%
+                  mutate(
+                    name = i, start = t,
+                    from = j
+                  ) 
+              )
+          } else if ("prob" %in% names(data[[i]][[paste0("time", t)]][[j]]) & 
+                     !is.null(data[[i]][[paste0("time", t)]][[j]]$prob)) {
+            if (!is.na(state_levels[1])) {
+              order <- match(
+                state_levels,
+                rownames(data[[i]][[paste0("time", t)]][[j]]$prob$trans)
+              )
+              order <- order[!is.na(order)]
+            } else {
+              order <- 1:nrow(data[[i]][[paste0("time", t)]][[j]]$prob$trans)
+            }
+            plot_df <- plot_df %>%
+              bind_rows(
+                prep_probtrans_df(data[[i]][[paste0("time", t)]][[j]]$prob,
+                  ord = order,
+                  from = data[[i]][[paste0("time", t)]][[j]]$from_new,
+                  state_names = rownames(data[[i]][[paste0("time", t)]][[j]]$prob$trans)
+                ) %>%
+                  mutate(
+                    name = i,
+                    from = j, 
+                    start = t, state = as.character(state)
+                  ) 
+              )
+          } else if (!is.null(data[[i]][[paste0("time", t)]][[j]]$prob)) {
+            message(paste(
+              "too small at risk set for time", t, "from",
+              j, data[[i]][[paste0("time", t)]][[j]]$from_name,
+              "n = ", data[[i]][[paste0("time", t)]][[j]]$n
+            ))
+          }
+        }
+      }
+    }
+    plot_df <- plot_df %>%
+      mutate(
+        CI_low = prob - qnorm((1 - conf.int) / 2, lower.tail = F) * se,
+        CI_upp = prob + qnorm((1 - conf.int) / 2, lower.tail = F) * se, 
+        CI_upp = ifelse(CI_upp > 1, 1, CI_upp), 
+        state2 = case_when(
+          combine_relsurv == T ~ gsub("\\.e|\\.p", "", state),
+          T ~ state
+        ),
+        type = case_when(
+          grepl("\\.e", state) ~ "excess",
+          grepl("\\.p", state) ~ "background",
+          T ~ "observed"
+        )
+      )
+    if (any(!is.na(state_levels))) {
+      if (combine_relsurv == T) {
+        plot_df <- plot_df %>%
+          mutate(state2 = factor(state2, levels = unique(gsub("\\.e|\\.p", "", state_levels))))
+      } else if (sum_perPhase == T) {
+        plot_df <- plot_df %>%
+          mutate(state2 = case_when(state %in% c("alive event-free","vaccination") ~ "alive", T ~ state),
+                 state2 = gsub(" \\.", "\\.", gsub(" after vaccination|after vaccination|event-free", "",
+                                                   gsub("vaccination after infection", "non-recent infection",state2))),
+                 state2 = factor(state_levels, levels = state_levels))
+      } else {
+        plot_df <- plot_df %>%
+          mutate(state2 = factor(state2, levels = state_levels))
+      }
+    } else if (sum_perPhase == T) {
+      plot_df <- plot_df %>%
+          mutate(state2 = case_when(state %in% c("alive event-free","vaccination") ~ "alive", T ~ state),
+                 state2 = gsub(" \\.", "\\.", gsub(" after vaccination|after vaccination|event-free", "", 
+                                                   gsub("vaccination after infection", "non-recent infection",state2))),
+                 )
+    } else {
+      plot_df <- plot_df %>%
+        mutate(state2 = as.factor(state2))
+    }
+    if (any(!is.na(levels))) {
+      plot_df <- plot_df %>%
+        mutate(name = factor(name, levels = levels))
+    }
+    if (hide_BackgroundMort == T) {
+      plot_df <- plot_df %>%
+        filter(!grepl("\\.p", state)) %>%
+        mutate(state2 = factor(gsub("dea", "excess dea", as.character(state2)),
+          levels = gsub("dea", "excess dea", levels(plot_df$state2))
+        ))
+    }
+    if (only_ExecssMort == T) {
+      plot_df <- plot_df %>%
+        filter(grepl("\\.e", state)) %>%
+        mutate(state2 = factor(gsub("dea", "excess dea", as.character(state2)),
+          levels = gsub("dea", "excess dea", levels(plot_df$state2))
+        ))
+    }
+    if (sum_aliveMort == T & sum_aliveMort_perState == F) {
+      plot_df <- plot_df %>%
+        group_by(name, from, time, state, start) %>%
+        mutate(no = 1, no = cumsum(no)) %>%
+        group_by(name, from, time, no, type, start) %>%
+        summarise(prob = sum(prob), .groups = "drop") %>%
+        left_join(df_variance2, by = c("time", "type", "from", "name", "start")) %>%
+        mutate(
+          SE = ifelse(variance < 0, 0, sqrt(variance)),
+          # variance sometimes just below 0 (e-18 or smaller)
+          CI_low = prob - qnorm((1 - conf.int) / 2, lower.tail = F) * SE,
+          CI_upp = prob + qnorm((1 - conf.int) / 2, lower.tail = F) * SE,
+          CI_upp = ifelse(!is.na(CI_upp) & CI_upp > 1, 1, CI_upp),
+          type = case_when(type == "observed" ~ "alive", T ~ type)
+        )
+    } else if (sum_aliveMort == T & sum_aliveMort_perState == T) {
+      plot_df <- plot_df %>%
+        group_by(name, from, time, state, start) %>%
+        mutate(no = 1, no = cumsum(no)) %>%
+        group_by(name, from, time, no, state2, start) %>%
+        summarise(prob = sum(prob), .groups = "drop") %>%
+        left_join(df_variance2, by = c("time", "state2", "from", "name", "start")) %>%
+        mutate(
+          SE = ifelse(variance < 0, 0, sqrt(variance)),
+          # variance sometimes just below 0 (e-18 or smaller)
+          CI_low = prob - qnorm((1 - conf.int) / 2, lower.tail = F) * SE,
+          CI_upp = prob + qnorm((1 - conf.int) / 2, lower.tail = F) * SE,
+          CI_upp = ifelse(!is.na(CI_upp) & CI_upp > 1, 1, CI_upp)
+        )
+    } else if (sum_perPhase == T) {
+      plot_df <- plot_df %>%
+        group_by(name, from, time, state, start) %>%
+        mutate(no = 1, no = cumsum(no)) %>%
+        group_by(name, from, time, no, state2, start) %>%
+        summarise(prob = sum(prob), .groups = "drop") %>%
+        left_join(df_variance2, by = c("time", "state2", "from", "name", "start")) %>%
+        mutate(
+          SE = ifelse(variance < 0, 0, sqrt(variance)),
+          # variance sometimes just below 0 (e-18 or smaller)
+          CI_low = prob - qnorm((1 - conf.int) / 2, lower.tail = F) * SE,
+          CI_upp = prob + qnorm((1 - conf.int) / 2, lower.tail = F) * SE,
+          CI_upp = ifelse(!is.na(CI_upp) & CI_upp > 1, 1, CI_upp)
+        )
+    }
+  } else { # get hazards
+    plot_df <- data.frame()
+    if (LM_data == F) {
+      for (i in names(data)) {
+        plot_df <- plot_df %>%
+          bind_rows(
+            plot(data[[i]][["haz"]], use.ggplot = T, type = "separate")$data %>%
+              mutate(name = i)
+          )
+      }
+    } else {
+      for (i in names(data)) {
+        for (t in start) {
+          for (j in from) {
+            if ("haz" %in% names(data[[i]][[paste0("time", t)]][[j]])) {
+              plot_df <- plot_df %>%
+                bind_rows(
+                  plot(data[[i]][[paste0("time", t)]][[j]]$haz,
+                    use.ggplot = T, type = "separate"
+                  )$data %>%
+                    mutate(
+                      name = i,
+                      from = rownames(data[[i]][["prob"]][[paste0("time", t)]]$trans)[j],
+                      start = t,
+                      from = j
+                    )
+                )
+            } else if ("mod" %in% names(data[[i]][[paste0("time", t)]][[j]])) {
+              plot_df <- plot_df %>%
+                bind_rows(
+                  plot(data[[i]][[paste0("time", t)]][[j]]$mod,
+                    use.ggplot = T, type = "separate"
+                  )$data %>%
+                    mutate(
+                      name = i,
+                      from = rownames(data[[i]][["prob"]][[paste0("time", t)]]$trans)[j],
+                      start = t,
+                      from = j
+                    )
+                )
+            } else {
+              message(paste(
+                "too small at risk set for time", t, "from",
+                j, data[[i]][[paste0("time", t)]][[j]]$from_name,
+                "n = ", data[[i]][[paste0("time", t)]][[j]]$n
+              ))
+            }
+          }
+        }
+      }
+    }
+  }
+  if (LM_data == T) {
+    plot_df$time <- plot_df$time + plot_df$start
+  }
+  return(plot_df)
+}
+
+# generate plots based on output of plot_data():
+plot_mstate <- function(plot_df, scale = "free_y", nrow = NA,
+                        combine_relsurv = F, hide_BackgroundMort = F,
+                        color_variable = "name", # other options: from, type
+                        facet_variable = "state", # other options: name
+                        use_grid = F, use_facet = T, use_color = T,
+                        grid_variable = list(rows = "type", cols = "name"),
+                        plot_type = "separate", adjust_names = T,
+                        remove_labels = "x", independent_scale = "y",
+                        wrap = NA, 
+                        use_linetype = F, linetype_variable = "type") {
+  if (hide_BackgroundMort == T) {
+    combine_relsurv <- F
+  }
+  if (use_grid == T & (!grid_variable$rows %in% names(plot_df) |
+    !grid_variable$cols %in% names(plot_df))) {
+    stop("grid_variable variable(s) not in dataset")
+  }
+  if (facet_variable == T & !facet_variable %in% names(plot_df)) {
+    stop("facet_variable variable(s) not in dataset")
+  }
+  if (combine_relsurv == T & facet_variable == "name") {
+    stop("combine_relsurv & facet on name not allowed")
+  }
+  if (plot_type == "filled" & facet_variable == "state") {
+    use_facet <- F
+  }
+  if ("Haz" %in% names(plot_df)) { # plot hazards
+    if ("name" %in% names(plot_df) & length(unique(plot_df$name)) > 1) {
+      plot_draw <- ggplot(
+        data = plot_df,
+        aes(x = time, y = Haz, color = color_variable, fill = color_variable)
+      )
+    } else if (plot_type == "single") {
+      plot_draw <- ggplot(data = plot_df, aes(
+        x = time, y = Haz, color = trans_name,
+        fill = trans_name
+      ))
+    } else {
+      plot_draw <- ggplot(data = plot_df, aes(x = time, y = Haz))
+    }
+    if (!is.na(nrow)) {
+      plot_draw <- plot_draw +
+        facet_wrap(~trans_name, scales = scale, nrow = nrow)
+    } else if (plot_type == "separate") {
+      plot_draw <- plot_draw +
+        facet_wrap(~trans_name, scales = scale)
+    }
+  } else { # plot probabilities
+    if (combine_relsurv == T) {
+      plot_df <- plot_df %>% mutate(color = type, linetype = pull(plot_df[linetype_variable]))
+    } else if (plot_type == "filled") {
+      plot_df <- plot_df %>% mutate(color = state2)
+    } else {
+      plot_df <- plot_df %>% mutate(color = pull(plot_df[color_variable]))
+    }
+    if (facet_variable == "state" & "state2" %in% names(plot_df) & plot_type != "filled") {
+      plot_df <- plot_df %>% mutate(facet = state2)
+    } else if (facet_variable %in% names(plot_df)) {
+      plot_df <- plot_df %>% mutate(facet = pull(plot_df[facet_variable]))
+    }
+    if (use_grid == T) {
+      plot_df <- plot_df %>% mutate(
+        row = pull(plot_df[grid_variable$rows]),
+        col = pull(plot_df[grid_variable$cols])
+      )
+    }
+    if (plot_type == "filled") {
+      plot_df <- plot_df %>% mutate(ymin = low, ymax = upp)
+    } else {
+      plot_df <- plot_df %>% mutate(ymin = CI_low, ymax = CI_upp)
+    }
+    if (use_grid == T) {
+      if (use_color == T & use_linetype == F) {
+        plot_draw <- ggplot(
+          data = plot_df,
+          aes(
+            x = time, y = prob, ymin = ymin, ymax = ymax,
+            color = color, fill = color
+          )
+        ) +
+          facet_grid2(row ~ col,
+            scales = scale, independent = independent_scale,
+            remove_labels = remove_labels
+          )
+      } else if (use_color == T){
+        plot_draw <- ggplot(
+          data = plot_df,
+          aes(
+            x = time, y = prob, ymin = ymin, ymax = ymax,
+            color = color, fill = color, linetype = linetype
+          )
+        ) +
+          facet_grid2(row ~ col,
+            scales = scale, independent = independent_scale,
+            remove_labels = remove_labels
+          )
+      } else {
+        plot_draw <- ggplot(
+          data = plot_df,
+          aes(x = time, y = prob, ymin = ymin, ymax = ymax)
+        ) +
+          facet_grid2(row ~ col,
+            scales = scale, independent = independent_scale,
+            remove_labels = remove_labels
+          )
+      }
+    } else if (use_facet == T & !is.na(nrow)) {
+      if (use_color == T & use_linetype == F) {
+        if (!is.na(wrap)) {
+          plot_draw <- ggplot(
+            data = plot_df,
+            aes(
+              x = time, y = prob, ymin = ymin, ymax = ymax,
+              color = color, fill = color
+            )
+          ) +
+            facet_wrap(~facet,
+              scales = scale, dir = "v", as.table = F, nrow = nrow,
+              labeller = as_labeller(~ stringr::str_wrap(.x, wrap))
+            )
+        } else {
+          plot_draw <- ggplot(
+            data = plot_df,
+            aes(
+              x = time, y = prob, ymin = ymin, ymax = ymax,
+              color = color, fill = color
+            )
+          ) +
+            facet_wrap(~facet, scales = scale, dir = "v", as.table = F, nrow = nrow)
+        }
+      } else if (use_color == T) {
+        if (!is.na(wrap)) {
+          plot_draw <- ggplot(
+            data = plot_df,
+            aes(
+              x = time, y = prob, ymin = ymin, ymax = ymax,
+              color = color, fill = color, linetype = linetype
+            )
+          ) +
+            facet_wrap(~facet,
+              scales = scale, dir = "v", as.table = F, nrow = nrow,
+              labeller = as_labeller(~ stringr::str_wrap(.x, wrap))
+            )
+        } else {
+          plot_draw <- ggplot(
+            data = plot_df,
+            aes(
+              x = time, y = prob, ymin = ymin, ymax = ymax,
+              color = color, fill = color, linetype = linetype
+            )
+          ) +
+            facet_wrap(~facet, scales = scale, dir = "v", as.table = F, nrow = nrow)
+        }
+      } else if (!is.na(wrap)) {
+        plot_draw <- ggplot(
+          data = plot_df,
+          aes(x = time, y = prob, ymin = ymin, ymax = ymax)
+        ) +
+          facet_wrap(~facet,
+            scales = scale, dir = "v", as.table = F, nrow = nrow,
+            labeller = as_labeller(~ stringr::str_wrap(.x, wrap))
+          )
+      } else {
+        plot_draw <- ggplot(
+          data = plot_df,
+          aes(x = time, y = prob, ymin = ymin, ymax = ymax)
+        ) +
+          facet_wrap(~facet, scales = scale, dir = "v", as.table = F, nrow = nrow)
+      }
+    } else if (use_facet == T) {
+      if (use_color == T & use_linetype == F) {
+        if (!is.na(wrap)) {
+          plot_draw <- ggplot(
+            data = plot_df,
+            aes(
+              x = time, y = prob, ymin = ymin, ymax = ymax,
+              color = color, fill = color
+            )
+          ) +
+            facet_wrap(~facet,
+              scales = scale, dir = "v", as.table = F,
+              labeller = as_labeller(~ stringr::str_wrap(.x, wrap))
+            )
+        } else {
+          plot_draw <- ggplot(
+            data = plot_df,
+            aes(
+              x = time, y = prob, ymin = ymin, ymax = ymax,
+              color = color, fill = color
+            )
+          ) +
+            facet_wrap(~facet, scales = scale, dir = "v", as.table = F)
+        }
+      } else if (use_color == T) {
+        if (!is.na(wrap)) {
+          plot_draw <- ggplot(
+            data = plot_df,
+            aes(
+              x = time, y = prob, ymin = ymin, ymax = ymax,
+              color = color, fill = color, linetype = linetype
+            )
+          ) +
+            facet_wrap(~facet,
+              scales = scale, dir = "v", as.table = F,
+              labeller = as_labeller(~ stringr::str_wrap(.x, wrap))
+            )
+        } else {
+          plot_draw <- ggplot(
+            data = plot_df,
+            aes(
+              x = time, y = prob, ymin = ymin, ymax = ymax,
+              color = color, fill = color, linetype = linetype
+            )
+          ) +
+            facet_wrap(~facet, scales = scale, dir = "v", as.table = F)
+        }
+      } else if (!is.na(wrap)) {
+        plot_draw <- ggplot(
+          data = plot_df,
+          aes(x = time, y = prob, ymin = ymin, ymax = ymax)
+        ) +
+          facet_wrap(~facet,
+            scales = scale, dir = "v", as.table = F,
+            labeller = as_labeller(~ stringr::str_wrap(.x, wrap))
+          )
+      } else {
+        plot_draw <- ggplot(
+          data = plot_df,
+          aes(x = time, y = prob, ymin = ymin, ymax = ymax)
+        ) +
+          facet_wrap(~facet, scales = scale, dir = "v", as.table = F)
+      }
+    } else if (use_color == T & use_linetype == F) {
+      plot_draw <- ggplot(
+        data = plot_df,
+        aes(
+          x = time, y = prob, ymin = ymin, ymax = ymax,
+          color = color, fill = color
+        )
+      )
+    } else if (use_color == T) {
+      plot_draw <- ggplot(
+        data = plot_df,
+        aes(
+          x = time, y = prob, ymin = ymin, ymax = ymax,
+          color = color, fill = color, linetype = linetype
+        )
+      )
+    } else {
+      plot_draw <- ggplot(
+        data = plot_df,
+        aes(x = time, y = prob, ymin = ymin, ymax = ymax)
+      )
+    }
+    plot_draw <- plot_draw +
+      annotate("rect", alpha = 1, fill = "grey80", xmin = -Inf, xmax = Inf, ymax = 0, ymin = -Inf) +
+      geom_ribbon(
+        alpha = ifelse(plot_type == "filled", 1, 0.3),
+        color = ifelse(plot_type == "filled", "black", "transparent")
+      )
+  }
+  if (plot_type != "filled") {
+    plot_draw <- plot_draw + geom_step()
+  }
+  plot_draw <- plot_draw +
+    ylab(ifelse("Haz" %in% names(plot_df), "Cumulative Hazard",
+                ifelse(all(grepl("dea", plot_df$state2)), "Cumulative probability", "Transition probability"))) +
+    theme_bw() +
+    theme(panel.grid = element_blank(), legend.title = element_blank()) +
+    coord_cartesian(expand = F)
+  if (combine_relsurv == F & length(unique(plot_df$name)) == 1 & color_variable != "from" &
+    plot_type == "separate") {
+    plot_draw <- plot_draw +
+      guides(color = "none", fill = "none")
+  } else if (plot_type == "filled") {
+    plot_draw <- plot_draw +
+      guides(fill = guide_legend(reverse = T))
+  }
+  return(suppressMessages(
+    plot_draw + 
+      scale_color_manual(values = c(
+        "background" = palette.colors()[6],
+        "excess" = palette.colors()[7],
+        "total mortality" = "black",
+        "observed" = "black",
+        "alive" = palette.colors()[4],
+        "HMD 2019" = palette.colors()[2],
+        "HMD 2015-2019" = palette.colors()[3],
+        "microdata averaged over the year" = palette.colors()[6],
+        "microdata per month" = palette.colors()[8],
+        "2021-01-01" = palette.colors()[2],
+        "2021-06-01" = palette.colors()[3],
+        "2021-09-01" = palette.colors()[6],
+        "2021-12-01" = palette.colors()[8]), name ="legend") + 
+      scale_fill_manual(values = c(
+        "background" = palette.colors()[6],
+        "excess" = palette.colors()[7],
+        "total mortality" = "black",
+        "observed"="black",
+        "alive"= palette.colors()[4],
+        "HMD 2019" = palette.colors()[2],
+        "HMD 2015-2019" = palette.colors()[3],
+        "microdata averaged over the year" = palette.colors()[6],
+        "microdata per month" = palette.colors()[8],
+        "2021-01-01" = palette.colors()[2],
+        "2021-06-01" = palette.colors()[3],
+        "2021-09-01" = palette.colors()[6],
+        "2021-12-01" = palette.colors()[8]), name ="legend")+
+    scale_linetype_manual(values = c("solid","dashed","solid","solid"), name ="legend")))
+}
+
+#### function to format x-axis ####
+plot_axis <- function(t0 = "Jun20", axis.x.text_angle = 0, paths = F, hide_months = F) {
+  list(
+    if (t0 == "Jun20") {
+      if (hide_months == T) {
+        scale_x_continuous(
+          NULL,
+          minor_breaks = NULL,
+          breaks = cumsum(c(
+            1, 30, 31, 31, 30, 31, 30, 31, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30
+          )),
+          labels = c(
+            "Jun '20", " ", "Aug '20", " ", "Oct '20", " ", "Dec '20",
+            " ", "Feb '21", " ", "Apr '21", " ",
+            "Jun '21", " ", "Aug '21", " ", "Oct '21", " ", "Dec '21"
+          )
+        )
+      } else {
+        scale_x_continuous(
+          NULL,
+          minor_breaks = NULL,
+          breaks = cumsum(c(
+            1, 30, 31, 31, 30, 31, 30, 31, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30
+          )),
+          labels = c(
+            "Jun '20", "Jul '20", "Aug '20", "Sep '20", "Oct '20", "Nov '20", "Dec '20",
+            "Jan '21", "Feb '21", "Mar '21", "Apr '21", "May '21", "Jun '21", "Jul '21",
+            "Aug '21", "Sep '21", "Oct '21", "Nov '21", "Dec '21"
+          )
+        )
+      }
+    } else if (t0 == "Jan20") {
+      if (hide_months == F) {
+        scale_x_continuous(
+          NULL,
+          minor_breaks = NULL,
+          breaks = cumsum(c(
+            1, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+            31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30
+          )),
+          labels = c(
+            "Jan '20", "Feb '20", "Mar '20", "Apr '20", "May '20",
+            "Jun '20", "Jul '20", "Aug '20", "Sep '20", "Oct '20", "Nov '20", "Dec '20",
+            "Jan '21", "Feb '21", "Mar '21", "Apr '21", "May '21",
+            "Jun '21", "Jul '21", "Aug '21", "Sep '21", "Oct '21", "Nov '21", "Dec '21"
+          )
+        )
+      } else {
+        scale_x_continuous(
+          NULL,
+          minor_breaks = NULL,
+          breaks = cumsum(c(
+            1, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+            31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30
+          )),
+          labels = c(
+            "Jan '20", " ", "Mar '20", " ", "May '20",
+            " ", "Jul '20", " ", "Sep '20", " ", "Nov '20", " ",
+            "Jan '21", " ", "Mar '21", " ", "May '21",
+            " ", "Jul '21", " ", "Sep '21", " ", "Nov '21", " "
+          )
+        )
+      }
+    },
+    theme(
+      axis.title.x = element_blank(), axis.text.x = element_text(hjust = 0),
+      axis.text = element_text(color = "black")
+    ),
+    if (axis.x.text_angle != 0) {
+      theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust = 0.3))
+    },
+    if (paths == T) {
+      theme(panel.spacing.y = unit(16, "points"))
+    }
+  )
+}
+
+#### add CBS waves in background ####
+df_waves <- data.frame(
+  wave = c("Covid-19 wave 1", "heat wave", "Covid-19 wave 2", "Covid-19 wave 3"),
+  start = as.Date(c("2020-03-23", "2020-08-10", "2020-09-21", "2021-08-16")),
+  stop = as.Date(c("2020-05-03", "2020-08-23", "2021-01-24", "2021-12-31"))
+) %>%
+  mutate(
+    start_int = as.numeric(start - as.Date("2019-12-31")),
+    stop_int = as.numeric(stop - as.Date("2019-12-31")),
+    Wave = ifelse(grepl("Covid", wave), "Covid-19", "heat")
+  )
+df_waves
+
+add_waves <- function(colors = palette.colors(palette = "Okabe - Ito")[c(2, 5)], facets = 1, t0 = "Jan20") {
+  p <- last_plot()
+  p$layers <- c(
+    geom_rect(
+      data = df_waves %>% rowwise() %>%
+        mutate(remove = ifelse(t0 == "Jun20" & start < as.Date("2020-06-01"), 1, 0),
+               start_int = ifelse(t0 == "Jun20", start_int - 152, start_int),
+               stop_int = ifelse(t0 == "Jun20", stop_int - 152, stop_int)) %>%
+        filter(remove == 0),
+      inherit.aes = F,
+      aes(xmin = start_int, xmax = stop_int, ymin = -Inf, ymax = Inf),
+      alpha = 0.2,
+      fill = `if`(t0 == "Jan20", rep(palette.colors()[c(2, 5, 2, 2)], facets), rep(palette.colors()[c(5, 2, 2)], facets))
+    ),
+    p$layers
+  )
+  plot(p)
+}
+```
+
+```{r reconstruct msfit and probtrans objects}
+func_prob() # export_rebuilt.xlsx -> excel file with all exported sheets made by 'export results from CBS.Rmd'
+```
+
+```{r order levels}
+# order of subsets
+levels_subset <- c(
+  "female <65", "female 65-69", "female 70-79", "female 80-89", "female 90+",
+  "male <65", "male 65-69", "male 70-79", "male 80-89", "male 90+"
+)
+
+# order of states
+state_levels_ms <- c(
+  "death after non-recent infection after vaccination",
+  "non-recent infection after vaccination", "death after vaccination after infection",
+  "death after non-recent infection", "death after recent infection after vaccination",
+  "recent infection after vaccination", "vaccination after infection",
+  "non-recent infection", "death after vaccination", "vaccination", "recent infection",
+  "death after recent infection", "death event-free", "alive event-free"
+)
+
+# order of states if death states are split into excess (.e) and background (.p)
+state_levels_ms_relsurv <- c(
+  "death after non-recent infection after vaccination.p",
+  "death after non-recent infection after vaccination.e",
+  "non-recent infection after vaccination", "death after vaccination after infection.p",
+  "death after vaccination after infection.e", "death after non-recent infection.p",
+  "death after non-recent infection.e", "death after recent infection after vaccination.p",
+  "death after recent infection after vaccination.e", "recent infection after vaccination",
+  "vaccination after infection", "non-recent infection", "death after vaccination.p",
+  "death after vaccination.e", "vaccination", "recent infection",
+  "death after recent infection.p", "death after recent infection.e", "death event-free.p",
+  "death event-free.e", "alive event-free"
+)
+
+# order of starting states in landmark analyses
+state_from <- factor(rev(c("alive event-free", "non-recent infection", "recent infection",
+                           "vaccination", "non-recent infection after vaccination",
+                           "recent infection after vaccination", "vaccination after infection")),
+                     ordered = T)
+```
+
+# total excess mortality
+This section shows the 'simple' relative survival outcomes:
+- scale is in days
+- year is start date (31 December 2019 or 31 May 2020 (so that 1 January and 1 June are time 1))
+- sex is sex
+- age is age_1Jan*365.241 - 1 (must be in days)
+- for 2-year analyses: use same background hazards (already implemented in the ratetables)
+
+```{r total excess mortality - numbers at risk}
+# get numbers at risk
+read_xlsx("export_rebuilt.xlsx", sheet = "surv_counts") %>%
+  group_by(start, state) %>%
+  summarise(sum = sum(n), .groups = "drop") %>%
+  pivot_wider(id_cols = state, names_from = start, values_from = sum)
+read_xlsx("export_rebuilt.xlsx", sheet = "surv_counts") %>%
+  pivot_wider(id_cols = c(sex_age, state), names_from = start, values_from = n)
+
+# censored at end of follow-up
+read_xlsx("export_rebuilt.xlsx", sheet = "censored731_subsets")
+```
+
+## Estimate pandemic-related mortality using default method: HMD (year: 2019, country: NL)
+```{r HMD 2019}
+# nedpop2: adjusted ratetable from HMD with hazards of 2019 for the years 2020 and 2021
+export_srv_19 <- plot_data(data = readRDS("export_relsurv_nedpop2_total_srv.rds"), estimate = "probtrans")
+
+# outcomes for 2020 and 2020+2021":
+export_srv_19 %>%
+  filter(time %in% c(366, 731)) %>%
+  filter(grepl("dea", state)) %>%
+  slice_tail(by = c(time, state, name)) %>%
+  select(time, state, prob, CI_low, CI_upp, type, name)
+
+# outcomes for only 2021:
+plot_data(
+  data = readRDS("export_relsurv_nedpop2_total_srv_LM.rds"),
+  estimate = "probtrans", start = 366) %>%
+  filter(time == max(time)) %>%
+  filter(grepl("dea", state)) %>%
+  slice_tail(by = c(time, state, name)) %>%
+  select(time, state, prob, CI_low, CI_upp, type, name)
+
+# subsets:
+export_srv_19_subsets <- plot_data(
+  data = list("male <65" = readRDS("export_relsurv_nedpop2_male_63_64_srv.rds"),
+              "male 65-69" = readRDS("export_relsurv_nedpop2_male_65_69_srv.rds"),
+              "male 70-79" = readRDS("export_relsurv_nedpop2_male_70_79_srv.rds"),
+              "male 80-89" = readRDS("export_relsurv_nedpop2_male_80_89_srv.rds"),
+              "male 90+" = readRDS("export_relsurv_nedpop2_male_90plus_srv.rds"),
+              "female <65" = readRDS("export_relsurv_nedpop2_female_63_64_srv.rds"),
+              "female 65-69" = readRDS("export_relsurv_nedpop2_female_65_69_srv.rds"),
+              "female 70-79" = readRDS("export_relsurv_nedpop2_female_70_79_srv.rds"),
+              "female 80-89" = readRDS("export_relsurv_nedpop2_female_80_89_srv.rds"),
+              "female 90+" = readRDS("export_relsurv_nedpop2_female_90plus_srv.rds")),
+  levels = levels_subset, estimate = "probtrans", combine_relsurv = T) 
+export_srv_19_subsets %>%
+  filter(time == max(time) & grepl("dea", state)) %>%
+  slice_tail(by = c(name, state)) %>%
+  select(time, state, prob:CI_upp, name) %>%
+  group_by(name) %>%
+  mutate(sum = sum(prob), perc = prob / sum * 100) %>%
+  print(n = Inf) %>%
+  filter(grepl("\\.e", state))
+```
+
+## Estimate pandemic-related mortality using mean HMD values for 2015-2019
+```{r HMD 2015-2019}
+# nedpop_1519: adjusted ratetable with mean hazards of 2015-2019 for the years 2020 and 2021
+export_srv_1519 <- plot_data(
+  data = readRDS("export_relsurv_nedpop_1519_total_srv.rds"),
+  estimate = "probtrans"
+)
+
+# outcomes for 2020 and 2020+2021:
+export_srv_1519 %>%
+  filter(time %in% c(366, 731)) %>%
+  filter(grepl("dea", state)) %>%
+  slice_tail(by = c(time, state, name)) %>%
+  select(time, state, prob, CI_low, CI_upp, type, name)
+
+# outcomes for only 2021:
+plot_data(
+  data = readRDS("export_relsurv_nedpop_1519_total_srv_LM.rds"),
+  estimate = "probtrans", start = 366
+) %>%
+  filter(time == max(time)) %>%
+  filter(grepl("dea", state)) %>%
+  slice_tail(by = c(time, state, name)) %>%
+  select(time, state, prob, CI_low, CI_upp, type, name)
+
+# subsets:
+export_srv_1519_subsets <- plot_data(
+  data = list("male <65" = readRDS("export_relsurv_nedpop_1519_male_63_64_srv.rds"),
+              "male 65-69" = readRDS("export_relsurv_nedpop_1519_male_65_69_srv.rds"),
+              "male 70-79" = readRDS("export_relsurv_nedpop_1519_male_70_79_srv.rds"),
+              "male 80-89" = readRDS("export_relsurv_nedpop_1519_male_80_89_srv.rds"),
+              "male 90+" = readRDS("export_relsurv_nedpop_1519_male_90plus_srv.rds"),
+              "female <65" = readRDS("export_relsurv_nedpop_1519_female_63_64_srv.rds"),
+              "female 65-69" = readRDS("export_relsurv_nedpop_1519_female_65_69_srv.rds"),
+              "female 70-79" = readRDS("export_relsurv_nedpop_1519_female_70_79_srv.rds"),
+              "female 80-89" = readRDS("export_relsurv_nedpop_1519_female_80_89_srv.rds"),
+              "female 90+" = readRDS("export_relsurv_nedpop_1519_female_90plus_srv.rds")),
+  levels = levels_subset, estimate = "probtrans") 
+export_srv_1519_subsets %>%
+  filter(time == max(time) & grepl("dea", state)) %>%
+  slice_tail(by = c(name, state)) %>%
+  select(time, state, prob:CI_upp, name) %>%
+  group_by(name) %>%
+  mutate(sum = sum(prob), perc = prob / sum * 100) %>%
+  print(n = Inf) %>%
+  filter(grepl("\\.e", state))
+```
+
+# Estimate pandemic-related mortality using ratetable based on microdata: hazard per sex and age
+```{r year}
+# nedpop_year: ratetable with calculated background hazards per sex and age
+export_srv_year <- plot_data(
+  data = readRDS("export_relsurv_nedpop_year_total_srv.rds"),
+  estimate = "probtrans")
+
+# outcomes for 2020 and 2020+2021":
+export_srv_year %>%
+  filter(time %in% c(366, 731)) %>%
+  filter(grepl("dea", state)) %>%
+  slice_tail(by = c(time, state, name)) %>%
+  select(time, state, prob, CI_low, CI_upp, type, name)
+
+# outcomes for only 2021:
+plot_data(
+  data = readRDS("export_relsurv_nedpop_year_total_srv_LM.rds"),
+  estimate = "probtrans", start = 366) %>%
+  filter(time == max(time)) %>%
+  filter(grepl("dea", state)) %>%
+  slice_tail(by = c(time, state, name)) %>%
+  select(time, state, prob, CI_low, CI_upp, type, name)
+
+# subsets:
+export_srv_year_subsets <- plot_data(
+  data = list("male <65" = readRDS("export_relsurv_nedpop_year_male_63_64_srv.rds"),
+              "male 65-69" = readRDS("export_relsurv_nedpop_year_male_65_69_srv.rds"),
+              "male 70-79" = readRDS("export_relsurv_nedpop_year_male_70_79_srv.rds"),
+              "male 80-89" = readRDS("export_relsurv_nedpop_year_male_80_89_srv.rds"),
+              "male 90+" = readRDS("export_relsurv_nedpop_year_male_90plus_srv.rds"),
+              "female <65" = readRDS("export_relsurv_nedpop_year_female_63_64_srv.rds"),
+              "female 65-69" = readRDS("export_relsurv_nedpop_year_female_65_69_srv.rds"),
+              "female 70-79" = readRDS("export_relsurv_nedpop_year_female_70_79_srv.rds"),
+              "female 80-89" = readRDS("export_relsurv_nedpop_year_female_80_89_srv.rds"),
+              "female 90+" = readRDS("export_relsurv_nedpop_year_female_90plus_srv.rds")),
+  levels = levels_subset, estimate = "probtrans") 
+export_srv_year_subsets %>%
+  filter(time == max(time) & grepl("dea", state)) %>%
+  slice_tail(by = c(name, state)) %>%
+  select(time, state, prob:CI_upp, name) %>%
+  group_by(name) %>%
+  mutate(sum = sum(prob), perc = prob / sum * 100) %>%
+  print(n = Inf) %>%
+  filter(grepl("\\.e", state))
+``` 
+
+## Estimate pandemic-related mortality using ratetable based on microdata: per sex, age and month (used for main analyses)
+```{r month}
+# nedpop_months: ratetable with calculated background hazards per sex, age and month
+
+#### probabilities #####
+export_srv_months <- plot_data(
+  data = readRDS("export_relsurv_nedpop_months_total_srv.rds"),
+  estimate = "probtrans")
+
+# outcomes for 2020 and 2020+2021":
+export_srv_months %>%
+  filter(time %in% c(366, 731)) %>%
+  filter(grepl("dea", state)) %>%
+  slice_tail(by = c(time, state, name)) %>%
+  select(time, state, prob, CI_low, CI_upp, type, name) %>%
+  group_by(time) %>%
+  mutate(total = sum(prob), prop = prob / total,
+         prob_perc = round(prob * 100, digits = 2), CI_low_perc = round(CI_low * 100, digits = 2),
+         CI_upp_prob = round(CI_upp * 100, digits = 2), prop_perc = round(prop * 100, digits = 2))
+
+# number of excess deaths:
+export_srv_months %>% filter(time == 731 & start == 0 & type == "excess") %>% tail(n = 1)%>%pull(prob) *
+  read_xlsx("export_rebuilt.xlsx", sheet = "entry_censored") %>%
+  filter(type == "entered dataset" & time == 0) %>% pull(n)
+
+# outcomes for only 2021:
+export_srv_months_21 <- plot_data(
+  data = readRDS("export_relsurv_nedpop_months_total_srv_LM.rds"),
+  estimate = "probtrans", start = 366)
+
+export_srv_months_21 %>%
+  filter(time == max(time)) %>%
+  filter(grepl("dea", state)) %>%
+  slice_tail(by = c(time, state, name)) %>%
+  select(time, state, prob, CI_low, CI_upp, type, name) %>%
+  mutate(total = sum(prob), prop = prob / total,
+         prob_perc = round(prob * 100, digits = 2), CI_low_perc = round(CI_low * 100, digits = 2),
+         CI_upp_prob = round(CI_upp * 100, digits = 2), prop_perc = round(prop * 100, digits = 2)) %>%
+  as_tibble()
+
+# subsets:
+export_srv_months_subsets <- plot_data(
+  data = list("male <65" = readRDS("export_relsurv_nedpop_months_male_63_64_srv.rds"),
+              "male 65-69" = readRDS("export_relsurv_nedpop_months_male_65_69_srv.rds"),
+              "male 70-79" = readRDS("export_relsurv_nedpop_months_male_70_79_srv.rds"),
+              "male 80-89" = readRDS("export_relsurv_nedpop_months_male_80_89_srv.rds"),
+              "male 90+" = readRDS("export_relsurv_nedpop_months_male_90plus_srv.rds"),
+              "female <65" = readRDS("export_relsurv_nedpop_months_female_63_64_srv.rds"),
+              "female 65-69" = readRDS("export_relsurv_nedpop_months_female_65_69_srv.rds"),
+              "female 70-79" = readRDS("export_relsurv_nedpop_months_female_70_79_srv.rds"),
+              "female 80-89" = readRDS("export_relsurv_nedpop_months_female_80_89_srv.rds"),
+              "female 90+" = readRDS("export_relsurv_nedpop_months_female_90plus_srv.rds")),
+  levels = levels_subset, estimate = "probtrans", combine_relsurv = T
+)
+
+export_srv_months_subsets %>%
+  filter(time == max(time) & grepl("dea", state)) %>%
+  slice_tail(by = c(name, state)) %>%
+  select(time, state, prob:CI_upp, name) %>% select(-se_state) %>%
+  group_by(name) %>%
+  mutate(sum = sum(prob), perc = prob / sum * 100, prob_abs = round(prob * 100, digits = 2),
+         CI_low_perc = round(CI_low * 100, digits = 2),
+         CI_upp_prob = round(CI_upp * 100, digits = 2)) %>%
+  arrange(name) %>% select(-c(cum_probs,low,upp,se)) %>%
+  print(n = Inf) %>%
+  filter(grepl("\\.e", state)) %>%
+  arrange(prob) %>%
+  arrange(perc)
+
+export_srv_months_subsets_21 <- plot_data(
+  data = list("male <65" = readRDS("export_relsurv_nedpop_months_male_63_64_srv_LM.rds"),
+              "male 65-69" = readRDS("export_relsurv_nedpop_months_male_65_69_srv_LM.rds"),
+              "male 70-79" = readRDS("export_relsurv_nedpop_months_male_70_79_srv_LM.rds"),
+              "male 80-89" = readRDS("export_relsurv_nedpop_months_male_80_89_srv_LM.rds"),
+              "male 90+" = readRDS("export_relsurv_nedpop_months_male_90plus_srv_LM.rds"),
+              "female <65" = readRDS("export_relsurv_nedpop_months_female_63_64_srv_LM.rds"),
+              "female 65-69" = readRDS("export_relsurv_nedpop_months_female_65_69_srv_LM.rds"),
+              "female 70-79" = readRDS("export_relsurv_nedpop_months_female_70_79_srv_LM.rds"),
+              "female 80-89" = readRDS("export_relsurv_nedpop_months_female_80_89_srv_LM.rds"),
+              "female 90+" = readRDS("export_relsurv_nedpop_months_female_90plus_srv_LM.rds")),
+  levels = levels_subset, estimate = "probtrans", start = 366, LM_data = T
+)
+export_srv_months_subsets_21 %>% slice_tail(by = c(name, from, start, state))
+
+#### hazards (total cohort) ####
+export_srv_months_haz <- plot_data(
+  data = readRDS("export_relsurv_nedpop_months_total_srv.rds"),
+  estimate = "hazard", start = 0) 
+
+#### figures ####
+export_srv_months_subsets %>%
+  mutate(
+    sex = ifelse(grepl("female", name), "Women", "Men"),
+    sex = factor(sex, levels = c("Women", "Men")),
+    age = gsub("female |male ", "", gsub("<65", "63-64", name)),
+    type = factor(type, levels = c("excess", "background"))
+  ) %>%
+  filter(grepl("dea", state)) %>%
+  plot_mstate(
+    use_grid = T, grid_variable = list(rows = "sex", cols = "age"),
+    color_variable = "type", scale = "free_y"
+  ) +
+  plot_axis(t0 = "Jan20", axis.x.text_angle = -45, hide_months = T) +
+  theme(
+    panel.spacing.y = unit(16, "points"),
+    legend.position = "inside", legend.justification = c(0, 1),
+    legend.background = element_rect(fill = "transparent"),
+    axis.text = element_text(size = 12), strip.text = element_text(size = 12),
+    axis.title.y = element_text(size = 13), legend.text = element_text(size = 13), 
+    plot.margin = margin(t = 1, r = 1, b = -5, l = 1, unit = "pt")
+  ) +
+  guides(color = guide_legend(reverse = T), fill = guide_legend(reverse = T)) +
+  geom_text(
+    data = export_srv_months_subsets %>%
+      filter(time == max(time) & grepl("dea", state)) %>% slice_tail(by = c(name, state)) %>%
+      select(time, state, prob:CI_upp, name) %>%
+      group_by(name) %>% mutate(total = sum(prob), prop = prob / total) %>%
+      filter(grepl("\\.e", state)) %>%
+      mutate(
+        row = ifelse(grepl("female", name), "Women", "Men"),
+        row = factor(row, levels = c("Women", "Men")),
+        col = gsub("female |male ", "", gsub("<65", "63-64", name))
+      ), inherit.aes = F,
+    aes(x = 725, y = (total - prob) * 0.15, label = paste0(
+      "Absolute: ", format(round(prob * 100, digits = 2), nsmall = 2), "%\nOf total mortality: ",
+      format(round(prop * 100, digits = 2), nsmall = 2), "%"
+    )),
+    hjust = 1, vjust = 0, size = 4.5
+  ) 
+ggsave("figures/FIG3.png",
+  width = 40, height = 20, units = "cm", dpi = 300
+)
+
+grid.arrange(
+  ggplot(
+    data = plot_mstate(export_srv_months_haz %>% filter(trans == 3))$data %>%
+      group_by(time) %>% mutate(nr = 1, nr = cumsum(nr)) %>%
+      filter(nr == max(nr)) %>% ungroup() %>%
+      mutate(currentHaz = ifelse(is.na(lag(Haz)), Haz, Haz - lag(Haz))),
+    aes(x = time, y = currentHaz)
+  ) +
+    annotate("rect", alpha = 1, fill = "grey80", xmin = -Inf, xmax = Inf, ymax = 0, ymin = -Inf) +
+    geom_rect(
+      data = df_waves, inherit.aes = F,
+      aes(xmin = start_int, xmax = stop_int, ymin = -Inf, ymax = Inf),
+      alpha = 0.2, fill = palette.colors()[c(2, 5, 2, 2)]
+    ) +
+    geom_step(color = palette.colors()[7], alpha = 0.3) +
+    ggformula::geom_spline(color =  palette.colors()[7]) +
+    coord_cartesian(expand = 0) +
+    scale_y_continuous("Smoothed\ndaily hazard", labels = scales::comma) +
+    theme_bw() +
+    theme(
+      axis.title.x = element_blank(), axis.text.x = element_blank(),
+      axis.line.x = element_blank(), axis.ticks.x = element_blank(),
+      legend.position = "inside", legend.justification = c(0, 1),
+      legend.background = element_rect(fill = "transparent"),
+      axis.text.y = element_text(size = 12, color = "black"),
+      axis.title.y = element_text(size = 14), panel.grid = element_blank(),
+      plot.margin = margin(t = 1, r = 1, b = 5, l = 1, unit = "pt")
+    ),
+  ggplot(
+    plot_mstate(
+      export_srv_months %>% filter(grepl("dea", state)) %>%
+        mutate(type = factor(type, levels = c("excess", "background"))),
+      use_facet = F, use_grid = F, combine_relsurv = T
+    )$data,
+    aes(x = time, y = prob, fill = type, ymin = CI_low, ymax = CI_upp)
+  ) +
+    annotate("rect", alpha = 1, fill = "grey80", xmin = -Inf, xmax = Inf, ymax = 0, ymin = -Inf) +
+    geom_rect(
+      data = df_waves, inherit.aes = F,
+      aes(xmin = start_int, xmax = stop_int, ymin = -Inf, ymax = Inf),
+      alpha = 0.2, fill = palette.colors()[c(2, 5, 2, 2)]
+    ) +
+    geom_ribbon(alpha = 0.3) +
+    geom_step(aes(color = type)) +
+    coord_cartesian(expand = 0) +
+    ylab("Cumulative probability") +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      legend.position = "inside", legend.justification = c(0, 1),
+      legend.background = element_rect(fill = "transparent"),
+      axis.text = element_text(size = 12, color = "black"), legend.text = element_text(size = 14),
+      axis.title = element_text(size = 14), legend.title = element_blank(),
+      axis.text.y = element_text(margin = margin(0, 2.2, 0, 39.4)),
+      plot.margin = margin(t = 1, r = 1, b = -5, l = 1, unit = "pt")
+    ) +
+    plot_axis(t0 = "Jan20", axis.x.text_angle = -45) +
+    guides(color = guide_legend(reverse = T), fill = guide_legend(reverse = T)) +
+    geom_text(
+      data = export_srv_months %>% filter(time == 731) %>% filter(grepl("dea", state)) %>%
+        slice_tail(by = c(time, state, name)) %>%
+        select(time, state, prob, CI_low, CI_upp, type, name) %>%
+        group_by(time) %>% mutate(total = sum(prob), prop = prob / total) %>%
+        filter(type == "excess"), inherit.aes = F,
+      aes(x = 730, y = prob * 1.2, label = paste0(
+        "Absolute: ", format(round(prob * 100, digits = 2), nsmall = 2),
+        "%\nOf total mortality: ",
+        format(round(prop * 100, digits = 2), nsmall = 2), "%"
+      )), hjust = 1, vjust = 0, size = 4.5
+    ) +
+    # colorblind-friendly colors:
+    scale_color_manual(values = as.character(palette.colors()[c(7, 6)])) +
+    scale_fill_manual(values = as.character(palette.colors()[c(7, 6)])),
+  nrow = 2, heights = c(0.2, 1)
+) %>% 
+  ggsave(filename = "figures/FIG2.png", width = 30, height = 20, units = "cm", dpi = 300)
+``` 
+
+## impact of the different background hazards
+```{r compare total excess mortality using different ratetables}
+rbind(export_srv_19 %>% mutate(name = "HMD 2019"),
+      export_srv_1519 %>% mutate(name = "HMD 2015-2019"),
+      export_srv_year %>% mutate(name = "microdata averaged over the year"),
+      export_srv_months %>% mutate(name = "microdata per month")) %>%
+  filter(type == "excess") %>%
+  mutate(name = factor(name, levels = c("HMD 2019", "HMD 2015-2019", "microdata averaged over the year",
+                                        "microdata per month"))) %>%
+  plot_mstate(use_facet = F, color_variable = "name") +
+  plot_axis(t0 = "Jan20", axis.x.text_angle = -45) +
+  theme(legend.position = "inside", legend.position.inside = c(0,1), legend.justification = c(0,1),
+        legend.background = element_blank(), plot.margin = margin(t = 2, r = 1, b = -5, l = 1, unit = "pt"),
+        legend.title = element_text(size = 10), legend.text = element_text(size = 10),
+        axis.text = element_text(size = 10))+
+  ylab("Cumulative excess mortality probability with 95%-CI") +
+  guides(color = guide_legend(title = "Background hazard based on:"),
+         fill = guide_legend(title = "Background hazard based on:"))
+ggsave("figures/suppl_analysis2.png",
+  width = 25, height = 15, units = "cm", dpi = 300
+)
+
+rbind(export_srv_19 %>% mutate(name = "HMD 2019"),
+      export_srv_1519 %>% mutate(name = "HMD 2015-2019"),
+      export_srv_year %>% mutate(name = "microdata averaged over the year"),
+      export_srv_months %>% mutate(name = "microdata per month")) %>%
+  filter(type == "excess") %>%
+  mutate(name = factor(name, levels = c("HMD 2019", "HMD 2015-2019", "microdata averaged over the year",
+                                        "microdata per month"))) %>%
+  filter(time == max(time)) %>%
+  slice_tail(by = c(name)) %>%
+  select(time, state, prob, CI_low, CI_upp, name)
+
+# subsets:
+rbind(export_srv_19_subsets %>% mutate(method = "HMD 2019"),
+      export_srv_1519_subsets %>% mutate(method = "HMD 2015-2019"),
+      export_srv_year_subsets %>% mutate(method = "microdata averaged over the year"),
+      export_srv_months_subsets %>% mutate(method = "microdata per month")) %>%
+  filter(type == "excess") %>%
+  mutate(
+    sex = ifelse(grepl("female", name), "female", "male"),
+    age = gsub("female |male ", "", gsub("<65", "63-64", name)),
+    method = factor(method, levels = c(
+      "HMD 2019", "HMD 2015-2019", "microdata averaged over the year", "microdata per month"
+    ))
+  ) %>%
+  filter(time == max(time)) %>%
+  slice_tail(by = c(name, method)) %>%
+  pivot_wider(id_cols = c(time, state, name), values_from = prob, names_from = method)
+```
+
+# Multi-state model
+
+```{r diagram}
+# box diagram showing the structure of the model
+transmat <- transMat(
+  list(
+    c(2, 3, 4),  # 1 alive event-free
+    c(5, 6),     # 2 vaccination
+    c(7, 8, 9),  # 3 infection
+    c(),         # 4 death event-free
+    c(10, 11),   # 5 infection after vaccination
+    c(),         # 6 death after vaccination
+    c(3, 8, 12), # 7 recovery after infection
+    c(5, 13),    # 8 vaccination after infection (day of vaccination, possibly before recovery is reached) 
+    c(),         # 9 death after infection
+    c(5, 14),    # 10 recovery after infection after vaccination
+    c(),         # 11 death after infection after vaccination
+    c(),         # 12 death after recovery after infection
+    c(),         # 13 death after vaccination after infection
+    c()          # 14 death after recovery after infection after vaccination
+  ), 
+  names = c( # use final names:
+    "alive event-free", "vaccination", "recent infection", "death event-free", 
+    "recent infection after vaccination", "death after vaccination", "non-recent infection", 
+    "vaccination after infection", "death after recent infection", 
+    "non-recent infection after vaccination", 
+    "death after recent infection after vaccination", "death after non-recent infection",
+    "death after vaccination after infection",  
+    "death after non-recent infection after vaccination"
+  )
+)
+
+# prepare diagram plot: boxes (states)
+df_states <- data.frame(state = rownames(transmat)) %>%
+  mutate(
+    xmin = case_when(
+      state %in% c("death event-free", "alive event-free") ~ 1,
+      state %in% c(
+        "death after vaccination", "vaccination", "recent infection",
+        "death after recent infection"
+      ) ~ 25,
+      state %in% c(
+        "death after recent infection after vaccination",
+        "recent infection after vaccination", "vaccination after infection",
+        "non-recent infection"
+      ) ~ 50,
+      T ~ 75
+    ),
+    xmax = xmin + 20,
+    xmid = xmin + 10,
+    ymax = case_when(
+      state %in% c(
+        "death event-free", "death after vaccination",
+        "death after recent infection after vaccination",
+        "death after non-recent infection after vaccination"
+      ) ~ 100,
+      state %in% c(
+        "alive event-free", "vaccination", "recent infection after vaccination",
+        "non-recent infection after vaccination"
+      ) ~ 80,
+      state %in% c(
+        "recent infection", "vaccination after infection",
+        "death after vaccination after infection"
+      ) ~ 60,
+      T ~ 40
+    ),
+    ymin = ymax - 10,
+    ymid = ymax - 5,
+    color = c(
+      "#00B0F0", "#00B0F0", "#00B0F0", "#CC0000", "#00B0F0", "#CC0000", "#00B0F0",
+      "#00B0F0", "#CC0000", "#00B0F0", "#CC0000", "#CC0000", "#CC0000", "#CC0000"
+    )
+  ) %>%
+  rowwise() %>%
+  mutate(fill = colorRampPalette(c(color, "white"))(4)[3]) %>%
+  ungroup()
+df_states
+
+# prepare diagram plot: arrows (transitions)
+df_trans <- melt(transmat) %>%
+  filter(!is.na(value)) %>%
+  select(-value) %>%
+  left_join(df_states %>% rename(from = state), by = "from") %>%
+  left_join(df_states %>% rename(to = state), by = "to") %>%
+  mutate(
+    x = case_when(
+      xmid.x == xmid.y ~ xmid.x,
+      xmid.x < xmid.y ~ xmax.x,
+      T ~ xmin.x
+    ),
+    xend = case_when(
+      xmid.x == xmid.y ~ xmid.x,
+      xmid.x < xmid.y ~ xmin.y,
+      T ~ xmax.y
+    ),
+    y = case_when(
+      xmid.x == xmid.y & ymid.x < ymid.y ~ ymax.x,
+      xmid.x == xmid.y ~ ymin.x,
+      T ~ ymid.x
+    ),
+    yend = case_when(
+      xmid.x == xmid.y & ymid.x < ymid.y ~ ymin.y,
+      xmid.x == xmid.y ~ ymax.y,
+      T ~ ymid.y
+    )
+  )
+df_trans
+
+# plot diagram (add numbers to state names)
+ggplot() +
+  geom_segment(
+    data = df_trans, aes(x = x, xend = xend, y = y, yend = yend),
+    arrow = arrow(length = unit(0.03, "npc"), type = "closed", angle = 20)
+  ) +
+  geom_rect(
+    data = df_states, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+    fill = "white",
+    color = df_states$color, linewidth = 1.5
+  ) +
+  geom_text(
+    data = df_states %>%
+      mutate(state = paste0(c(1:14), ". ", df_states$state)),
+    aes(x = xmid, y = ymid, label = stringr::str_wrap(state, 20)),
+    hjust = 0.5, vjust = 0.5, size = 4
+  ) +
+  theme_void() +
+  scale_x_continuous(expand = c(0.01, 0.01)) +
+  scale_y_continuous(expand = c(0.01, 0.01))
+ggsave("figures/FIG1.png", width = 20, height = 15, units = "cm", dpi = 300)
+```
+
+```{r at risk numbers}
+df_counts <- read_xlsx("export_rebuilt.xlsx", "mstate_counts_l") %>% 
+  pivot_longer(cols = -c(state, time), names_to = "subset", values_to = "n") %>%
+  full_join(expand.grid(state = state_levels_ms, subset = levels_subset, time = c(0:579))) %>%
+  arrange(subset, state, time) %>%
+  mutate(n = ifelse(time == 0 & is.na(n), 0, n)) %>%
+  group_by(subset, state) %>%
+  fill(n, .direction = "down") %>%
+  filter(n >= 10)
+df_counts
+
+df_counts %>% filter(time > 0) %>%
+  mutate(name = gsub("male", "Men", gsub("female", "Women", gsub("<65", "63-64", subset))),
+         name = factor(name, levels = c("Women 63-64", "Men 63-64", "Women 65-69", "Men 65-69", "Women 70-79", "Men 70-79",
+                                        "Women 80-89", "Men 80-89", "Women 90+", "Men 90+")),
+         state = factor(state, levels = c("non-recent infection", "vaccination after infection",
+                                          "non-recent infection after vaccination", "recent infection", "vaccination",
+                                          "recent infection after vaccination", 
+                                          "alive event-free"))) %>%
+  ggplot(aes(x = time, y = n, fill = name)) +
+  facet_wrap(~state, scales = "free_y", as.table = F, dir = "v")+
+  geom_col(width = 1)+
+  theme_bw() +
+  theme(panel.grid = element_blank(), legend.position.inside = c(0,0), legend.position = "inside", legend.justification = c(0,0),
+        plot.margin = margin(t = 1, r = 16, b = 0, l = 1, unit = "pt")) +
+  coord_cartesian(expand = F)+
+  geom_vline(data = data.frame(time = c(215, 366, 458, 549)), color = "black", linetype = "dashed", aes(xintercept = time))+
+  plot_axis(axis.x.text_angle = 45, hide_months = T)+
+  scale_fill_viridis_d(name = NULL, direction = -1)+
+  ylab("Number of persons") +
+  scale_y_continuous(labels = scales::label_number(zero.print = "<10", trim = F, big.mark = ","))
+ggsave("figures/suppl_fig2.png",width = 21, height = 15, units = "cm", dpi = 300)
+```
+
+## multi-state model with relsurv based on microdata: per sex, age and month
+```{r mstate month}
+export_mstate_months <- plot_data(
+  data = readRDS("export_relsurv_nedpop_months_total.rds"),
+  estimate = "probtrans", state_levels = state_levels_ms_relsurv
+)
+
+# cumulative probabilities at end of follow-up:
+export_mstate_months %>%
+  slice_tail(by = c("state")) %>%
+  select(time, prob, CI_low, CI_upp, state)
+
+export_mstate_months_obs <- plot_data(
+  data = readRDS("export_relsurv_nedpop_months_total.rds"),
+  estimate = "probtrans", sum_aliveMort = T, sum_aliveMort_perState = T) %>%
+  mutate(type = "total mortality",
+         state2 = factor(state2,levels(export_mstate_months$state2))) %>% 
+  filter(grepl("dea", state2))
+
+export_mstate_months %>%
+  mutate(type = ifelse(type == "observed", "alive", type)) %>%
+  bind_rows(export_mstate_months_obs) %>%
+  mutate(type = factor(type, levels = c("alive", "total mortality", "excess", "background"))) %>%
+  plot_mstate(facet_variable = "state2", combine_relsurv = T, wrap = 30, use_linetype = T) +
+  plot_axis(axis.x.text_angle = -45, paths = T, hide_months = T) +
+  theme(
+    legend.position = c(0, 0), legend.justification = c(0, 0),
+    text = element_text(size = 12), strip.text = element_text(size = 12),
+    legend.text = element_text(size = 12), plot.margin = margin(t = 1, r = 18, b = -5, l = 1, unit = "pt")
+  ) 
+ggsave("figures/FIG4.png",
+  add_paths(), 
+  width = 30, height = 20, units = "cm", dpi = 300
+)
+
+# subsets
+export_mstate_months_subsets <- plot_data(
+  data = list("male <65" = readRDS("export_relsurv_nedpop_months_male_63_64.rds"),
+              "male 65-69" = readRDS("export_relsurv_nedpop_months_male_65_69.rds"),
+              "male 70-79" = readRDS("export_relsurv_nedpop_months_male_70_79.rds"),
+              "male 80-89" = readRDS("export_relsurv_nedpop_months_male_80_89.rds"),
+              "male 90+" = readRDS("export_relsurv_nedpop_months_male_90plus.rds"),
+              "female <65" = readRDS("export_relsurv_nedpop_months_female_63_64.rds"),
+              "female 65-69" = readRDS("export_relsurv_nedpop_months_female_65_69.rds"),
+              "female 70-79" = readRDS("export_relsurv_nedpop_months_female_70_79.rds"),
+              "female 80-89" = readRDS("export_relsurv_nedpop_months_female_80_89.rds"),
+              "female 90+" = readRDS("export_relsurv_nedpop_months_female_90plus.rds")),
+  levels = levels_subset, state_levels = state_levels_ms_relsurv, estimate = "probtrans",
+  hide_BackgroundMort = T
+)
+
+export_mstate_months_subsets_all <- plot_data(
+  data = list("male <65" = readRDS("export_relsurv_nedpop_months_male_63_64.rds"),
+              "male 65-69" = readRDS("export_relsurv_nedpop_months_male_65_69.rds"),
+              "male 70-79" = readRDS("export_relsurv_nedpop_months_male_70_79.rds"),
+              "male 80-89" = readRDS("export_relsurv_nedpop_months_male_80_89.rds"),
+              "male 90+" = readRDS("export_relsurv_nedpop_months_male_90plus.rds"),
+              "female <65" = readRDS("export_relsurv_nedpop_months_female_63_64.rds"),
+              "female 65-69" = readRDS("export_relsurv_nedpop_months_female_65_69.rds"),
+              "female 70-79" = readRDS("export_relsurv_nedpop_months_female_70_79.rds"),
+              "female 80-89" = readRDS("export_relsurv_nedpop_months_female_80_89.rds"),
+              "female 90+" = readRDS("export_relsurv_nedpop_months_female_90plus.rds")),
+  levels = levels_subset, state_levels = state_levels_ms_relsurv, estimate = "probtrans"
+)
+
+export_mstate_months_subsets_obs <- plot_data(
+  data = list("male <65" = readRDS("export_relsurv_nedpop_months_male_63_64.rds"),
+              "male 65-69" = readRDS("export_relsurv_nedpop_months_male_65_69.rds"),
+              "male 70-79" = readRDS("export_relsurv_nedpop_months_male_70_79.rds"),
+              "male 80-89" = readRDS("export_relsurv_nedpop_months_male_80_89.rds"),
+              "male 90+" = readRDS("export_relsurv_nedpop_months_male_90plus.rds"),
+              "female <65" = readRDS("export_relsurv_nedpop_months_female_63_64.rds"),
+              "female 65-69" = readRDS("export_relsurv_nedpop_months_female_65_69.rds"),
+              "female 70-79" = readRDS("export_relsurv_nedpop_months_female_70_79.rds"),
+              "female 80-89" = readRDS("export_relsurv_nedpop_months_female_80_89.rds"),
+              "female 90+" = readRDS("export_relsurv_nedpop_months_female_90plus.rds")),
+  estimate = "probtrans", sum_aliveMort = T, sum_aliveMort_perState = T) %>%
+  mutate(type = "total mortality",
+         state2 = factor(state2,levels(export_mstate_months$state2))) %>% 
+  filter(grepl("dea", state2))
+
+export_mstate_months_subsets_all %>%
+  mutate(type = ifelse(type == "observed", "alive", type)) %>%
+  bind_rows(export_mstate_months_subsets_obs) %>%
+  mutate(type = factor(type, levels = c("alive", "total mortality", "excess", "background"))) %>%
+  filter(name == "female <65") %>%
+  plot_mstate(facet_variable = "state2", combine_relsurv = T, wrap = 30, use_linetype = T) +
+  plot_axis(axis.x.text_angle = -45, paths = T, hide_months = T) +
+  theme(
+    legend.position = c(0, 0), legend.justification = c(0, 0),
+    text = element_text(size = 12), strip.text = element_text(size = 12),
+    legend.text = element_text(size = 12), plot.margin = margin(t = 1, r = 18, b = -5, l = 1, unit = "pt")
+  )
+ggsave("figures/suppl_fig5.png", plot = add_paths(), width = 30, height = 20, units = "cm", dpi = 300)
+
+export_mstate_months_subsets_all %>%
+  mutate(type = ifelse(type == "observed", "alive", type)) %>%
+  bind_rows(export_mstate_months_subsets_obs) %>%
+  mutate(type = factor(type, levels = c("alive", "total mortality", "excess", "background"))) %>%
+  filter(name == "male <65") %>%
+  plot_mstate(facet_variable = "state", combine_relsurv = T, wrap = 30, use_linetype = T) +
+  plot_axis(axis.x.text_angle = -45, paths = T, hide_months = T) +
+  theme(
+    legend.position = c(0, 0), legend.justification = c(0, 0),
+    text = element_text(size = 12), strip.text = element_text(size = 12),
+    legend.text = element_text(size = 12), plot.margin = margin(t = 1, r = 18, b = -5, l = 1, unit = "pt")
+  )
+ggsave("figures/suppl_fig6.png", plot = add_paths(), width = 30, height = 20, units = "cm", dpi = 300)
+
+export_mstate_months_subsets_all %>%
+  mutate(type = ifelse(type == "observed", "alive", type)) %>%
+  bind_rows(export_mstate_months_subsets_obs) %>%
+  mutate(type = factor(type, levels = c("alive", "total mortality", "excess", "background"))) %>%
+  filter(name == "female 65-69") %>%
+  plot_mstate(facet_variable = "state", combine_relsurv = T, wrap = 30, use_linetype = T) +
+  plot_axis(axis.x.text_angle = -45, paths = T, hide_months = T) +
+  theme(
+    legend.position = c(0, 0), legend.justification = c(0, 0),
+    text = element_text(size = 12), strip.text = element_text(size = 12),
+    legend.text = element_text(size = 12), plot.margin = margin(t = 1, r = 18, b = -5, l = 1, unit = "pt")
+  )
+ggsave("figures/suppl_fig7.png",plot = add_paths(), width = 30, height = 20, units = "cm", dpi = 300)
+
+export_mstate_months_subsets_all %>%
+  mutate(type = ifelse(type == "observed", "alive", type)) %>%
+  bind_rows(export_mstate_months_subsets_obs) %>%
+  mutate(type = factor(type, levels = c("alive", "total mortality", "excess", "background"))) %>%
+  filter(name == "male 65-69") %>%
+  plot_mstate(facet_variable = "state", combine_relsurv = T, wrap = 30, use_linetype = T) +
+  plot_axis(axis.x.text_angle = -45, paths = T, hide_months = T) +
+  theme(
+    legend.position = c(0, 0), legend.justification = c(0, 0),
+    text = element_text(size = 12), strip.text = element_text(size = 12),
+    legend.text = element_text(size = 12), plot.margin = margin(t = 1, r = 18, b = -5, l = 1, unit = "pt")
+  )
+ggsave("figures/suppl_fig8.png", plot = add_paths(), width = 30, height = 20, units = "cm", dpi = 300)
+
+export_mstate_months_subsets_all %>%
+  mutate(type = ifelse(type == "observed", "alive", type)) %>%
+  bind_rows(export_mstate_months_subsets_obs) %>%
+  mutate(type = factor(type, levels = c("alive", "total mortality", "excess", "background"))) %>%
+  filter(name == "female 70-79") %>%
+  plot_mstate(facet_variable = "state", combine_relsurv = T, wrap = 30, use_linetype = T) +
+  plot_axis(axis.x.text_angle = -45, paths = T, hide_months = T) +
+  theme(
+    legend.position = c(0, 0), legend.justification = c(0, 0),
+    text = element_text(size = 12), strip.text = element_text(size = 12),
+    legend.text = element_text(size = 12), plot.margin = margin(t = 1, r = 18, b = -5, l = 1, unit = "pt")
+  )
+ggsave("figures/suppl_fig9.png", plot = add_paths(), width = 30, height = 20, units = "cm", dpi = 300)
+
+export_mstate_months_subsets_all %>%
+  mutate(type = ifelse(type == "observed", "alive", type)) %>%
+  bind_rows(export_mstate_months_subsets_obs) %>%
+  mutate(type = factor(type, levels = c("alive", "total mortality", "excess", "background"))) %>%
+  filter(name == "male 70-79") %>%
+  plot_mstate(facet_variable = "state", combine_relsurv = T, wrap = 30, use_linetype = T) +
+  plot_axis(axis.x.text_angle = -45, paths = T, hide_months = T) +
+  theme(
+    legend.position = c(0, 0), legend.justification = c(0, 0),
+    text = element_text(size = 12), strip.text = element_text(size = 12),
+    legend.text = element_text(size = 12), plot.margin = margin(t = 1, r = 18, b = -5, l = 1, unit = "pt")
+  )
+ggsave("figures/suppl_fig10.png", plot = add_paths(), width = 30, height = 20, units = "cm", dpi = 300)
+
+export_mstate_months_subsets_all %>%
+  mutate(type = ifelse(type == "observed", "alive", type)) %>%
+  bind_rows(export_mstate_months_subsets_obs) %>%
+  mutate(type = factor(type, levels = c("alive", "total mortality", "excess", "background"))) %>%
+  filter(name == "female 80-89") %>%
+  plot_mstate(facet_variable = "state", combine_relsurv = T, wrap = 30, use_linetype = T) +
+  plot_axis(axis.x.text_angle = -45, paths = T, hide_months = T) +
+  theme(
+    legend.position = c(0, 0), legend.justification = c(0, 0),
+    text = element_text(size = 12), strip.text = element_text(size = 12),
+    legend.text = element_text(size = 12), plot.margin = margin(t = 1, r = 18, b = -5, l = 1, unit = "pt")
+  )
+ggsave("figures/suppl_fig11.png", plot = add_paths(), width = 30, height = 20, units = "cm", dpi = 300)
+
+export_mstate_months_subsets_all %>%
+  mutate(type = ifelse(type == "observed", "alive", type)) %>%
+  bind_rows(export_mstate_months_subsets_obs) %>%
+  mutate(type = factor(type, levels = c("alive", "total mortality", "excess", "background"))) %>%
+  filter(name == "male 80-89") %>%
+  plot_mstate(facet_variable = "state", combine_relsurv = T, wrap = 30, use_linetype = T) +
+  plot_axis(axis.x.text_angle = -45, paths = T, hide_months = T) +
+  theme(
+    legend.position = c(0, 0), legend.justification = c(0, 0),
+    text = element_text(size = 12), strip.text = element_text(size = 12),
+    legend.text = element_text(size = 12), plot.margin = margin(t = 1, r = 18, b = -5, l = 1, unit = "pt")
+  )
+ggsave("figures/suppl_fig12.png", plot = add_paths(), width = 30, height = 20, units = "cm", dpi = 300)
+
+export_mstate_months_subsets_all %>%
+  mutate(type = ifelse(type == "observed", "alive", type)) %>%
+  bind_rows(export_mstate_months_subsets_obs) %>%
+  mutate(type = factor(type, levels = c("alive", "total mortality", "excess", "background"))) %>%
+  filter(name == "female 90+") %>%
+  plot_mstate(facet_variable = "state", combine_relsurv = T, wrap = 30, use_linetype = T) +
+  plot_axis(axis.x.text_angle = -45, paths = T, hide_months = T) +
+  theme(
+    legend.position = c(0, 0), legend.justification = c(0, 0),
+    text = element_text(size = 12), strip.text = element_text(size = 12),
+    legend.text = element_text(size = 12), plot.margin = margin(t = 1, r = 18, b = -5, l = 1, unit = "pt")
+  )
+ggsave("figures/suppl_fig13.png", plot = add_paths(), width = 30, height = 20, units = "cm", dpi = 300)
+
+export_mstate_months_subsets_all %>%
+  mutate(type = ifelse(type == "observed", "alive", type)) %>%
+  bind_rows(export_mstate_months_subsets_obs) %>%
+  mutate(type = factor(type, levels = c("alive", "total mortality", "excess", "background"))) %>%
+  filter(name == "male 90+") %>%
+  plot_mstate(facet_variable = "state", combine_relsurv = T, wrap = 30, use_linetype = T) +
+  plot_axis(axis.x.text_angle = -45, paths = T, hide_months = T) +
+  theme(
+    legend.position = c(0, 0), legend.justification = c(0, 0),
+    text = element_text(size = 12), strip.text = element_text(size = 12),
+    legend.text = element_text(size = 12), plot.margin = margin(t = 1, r = 18, b = -5, l = 1, unit = "pt")
+  )
+ggsave("figures/suppl_fig14.png", plot = add_paths(), width = 30, height = 20, units = "cm", dpi = 300)
+
+# outcome at end of follow-up:
+rbind(export_mstate_months %>% 
+        slice_tail(by = c(state2, type), n = 1) %>% select(name, state2, type, prob, CI_low, CI_upp),
+      export_mstate_months_obs %>% 
+        slice_tail(by = c(state2, type), n = 1) %>% select(name, state2, type, prob, CI_low, CI_upp),
+      export_mstate_months_subsets_all %>% 
+        slice_tail(by = c(state2, type, name), n = 1) %>% select(name, state2, type, prob, CI_low, CI_upp),
+      export_mstate_months_subsets_obs %>% 
+        slice_tail(by = c(state2, type, name), n = 1) %>% select(name, state2, type, prob, CI_low, CI_upp)) %>%
+  mutate(value = paste0(formatC(round(prob*100, 2), format = 'f', digits = 2), " (", 
+                        formatC(round(CI_low*100, 2), format = 'f', digits = 2), "-", 
+                        formatC(round(CI_upp*100, 2), format = 'f', digits = 2), ")"),
+         state3 = gsub("death after |death |alive ", "", state2),
+         state3 = factor(state3, levels = c("event-free", "recent infection", "non-recent infection", "vaccination",
+                                            "vaccination after infection", "recent infection after vaccination",
+                                            "non-recent infection after vaccination")),
+         name = factor(name, levels = c("total",levels_subset)),
+         type2 = ifelse(!grepl("dea", state2), "alive", type),
+         name = factor(name, levels = c("total", "female <65", "male <65", "female 65-69", "male 65-69", "female 70-79", "male 70-79",
+                                        "female 80-89", "male 80-89", "female 90+", "male 90+"))) %>%
+  pivot_wider(id_cols = c(name, state3), names_from = type2, values_from = value) %>%
+  arrange(name,state3) %>%
+  openxlsx::write.xlsx("SuppTabl3.xlsx")
+
+### outcome at specific times ####
+# peak of second wave
+export_mstate_months %>% 
+  filter(time >= as.numeric(df_waves$start[df_waves$wave == "Covid-19 wave 2"] - as.Date("2020-05-31")) &
+           time <= as.numeric(df_waves$stop[df_waves$wave == "Covid-19 wave 2"] - as.Date("2020-05-31"))) %>% 
+  filter(state == "recent infection") %>% filter(prob == max(prob)) %>%
+  mutate(date = as.Date("2020-05-31") + time,
+         value = paste0(round(prob*100,2), " (95%-CI ", round(CI_low*100,2),"-",round(CI_upp*100,2),")"))
+# 1 June 2021
+export_mstate_months %>% filter(time == as.numeric(as.Date("2021-06-01") - as.Date("2020-05-31"))) %>%
+  slice_tail(by = state) %>%
+  mutate(value = paste0(round(prob*100,2), " (95%-CI ", round(CI_low*100,2),"-",round(CI_upp*100,2),")")) %>%
+  select(time, state, value)
+# peak of third wave
+export_mstate_months %>% 
+  filter(time >= as.numeric(df_waves$start[df_waves$wave == "Covid-19 wave 3"] - as.Date("2020-05-31")) &
+           time <= as.numeric(df_waves$stop[df_waves$wave == "Covid-19 wave 3"] - as.Date("2020-05-31"))) %>% 
+  filter(state == "recent infection") %>% filter(prob == max(prob)) %>%
+  mutate(date = as.Date("2020-05-31") + time,
+         value = paste0(round(prob*100,2), " (95%-CI ", round(CI_low*100,2),"-",round(CI_upp*100,2),")"))
+export_mstate_months %>%
+  filter(time >= as.numeric(df_waves$start[df_waves$wave == "Covid-19 wave 3"] - as.Date("2020-05-31")) & 
+           time <= as.numeric(df_waves$stop[df_waves$wave == "Covid-19 wave 3"] - as.Date("2020-05-31"))) %>% 
+  filter(state == "recent infection after vaccination") %>% filter(prob == max(prob)) %>%
+  mutate(date = as.Date("2020-05-31") + time,
+         value = paste0(round(prob*100,2), " (95%-CI ", round(CI_low*100,2),"-",round(CI_upp*100,2),")"))
+
+### landmark analyses ####
+export_LM_total <- plot_data(readRDS("export_relsurv_nedpop_months_total_LM.rds"),
+  start = c(366 - 152, 517 - 152, 609 - 152, 700 - 152), from = state_from,
+  LM_data = T, estimate = "probtrans", sum_aliveMort = T)
+export_LM_total %>%
+  filter(type == "excess") %>%
+  slice_tail(by = c(name, from, start))
+
+export_LM_total %>%
+  filter(type == "excess") %>%
+  mutate(
+    LM = as.Date("2020-06-01") + start,
+    LM = factor(LM, levels = c("2021-01-01", "2021-06-01", "2021-09-01", "2021-12-01")),
+    from = factor(from, levels = c("non-recent infection", "vaccination after infection", "non-recent infection after vaccination",
+                                   "recent infection", "vaccination","recent infection after vaccination","alive event-free"))
+  ) %>%
+  plot_mstate(facet_variable = "from", color_variable = "LM", scale = "fixed") +
+  plot_axis(axis.x.text_angle = -45) +
+  theme(
+    legend.position = c(0, 0), legend.justification = c(0, 0),
+    legend.title = element_text(), plot.margin = margin(t = 1, r = 10, b = -5, l = 1, unit = "pt")
+  ) +
+  guides(
+    color = guide_legend(title = "Landmark time"),
+    fill = guide_legend(title = "Landmark time")
+  ) +
+  ylab("Cumulative probability of excess mortality")
+ggsave("figures/suppl_fig15.png", width = 20, height = 15, units = "cm", dpi = 300)
+
+export_LM_total_full <- plot_data(readRDS("export_relsurv_nedpop_months_total_LM.rds"),
+  start = c(366 - 152, 517 - 152, 609 - 152, 700 - 152), from = state_from,
+  LM_data = T, estimate = "probtrans", sum_aliveMort = F
+)
+
+ggplot(export_LM_total %>% filter(type == "excess") %>% slice_tail(by = c(name, from, start)) %>%
+  mutate(
+    from = factor(from, levels = c(
+      "alive event-free", "recent infection", "non-recent infection", "vaccination",
+      "vaccination after infection", "recent infection after vaccination",
+      "non-recent infection after vaccination"
+    )),
+    date = as.Date("2020-06-01") + start
+  )) +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = 0, fill = "grey", alpha = 0.3) +
+  geom_linerange(aes(ymin = CI_low, ymax = CI_upp, color = as.factor(date), x = as.factor(from)),
+    position = position_dodge(width = 0.75), linewidth = 1
+  ) +
+  geom_point(aes(y = prob, color = as.factor(date), x = from),
+    position = position_dodge(width = 0.75), size = 2
+  ) +
+  annotate("segment", x = c(1:6) + 0.5, xend = c(1:6) + 0.5, y = -Inf, yend = Inf) +
+  theme_bw() +
+  theme(
+    axis.text = element_text(color = "black"),
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 10),
+    axis.title.x = element_blank(), legend.text = element_text(size = 10), 
+    panel.grid.major.x = element_blank(), plot.margin = margin(t = 1, r = 1, b = 1, l = 1, unit = "pt")
+  ) +
+  ylab("Probability of excess death until 31 December 2021") +
+  scale_fill_viridis_d() +
+  guides(color = guide_legend(title = "Present in state on day:")) +
+  # colorblind-friendly colors:
+  scale_color_manual(values = as.character(palette.colors()[c(2, 3, 6, 8)])) +
+  scale_fill_manual(values = as.character(palette.colors()[c(2, 3, 6, 8)]))
+ggsave("figures/FIG5.png", width = 20, height = 15, units = "cm", dpi = 300)
+
+export_LM_total_phase <- plot_data(readRDS("export_relsurv_nedpop_months_total_LM.rds"),
+  start = c(366 - 152, 517 - 152, 609 - 152, 700 - 152), from = c("alive event-free", "vaccination"),
+  LM_data = T, estimate = "probtrans", sum_aliveMort = F, sum_perPhase = T
+)
+export_LM_total_phase %>%
+  filter(from %in% c("alive event-free", "vaccination") & 
+           state2 %in% c("recent infection", "non-recent infection") & start == 517 - 152) %>%
+  mutate(
+    state_f =
+      factor(as.character(state2),
+        levels = c("recent infection", "non-recent infection"),
+        labels = c("recent infection", "non-recent infection"))) %>%
+  plot_mstate(facet_variable = "state_f", color_variable = "from") +
+  plot_axis(axis.x.text_angle = -45) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(),
+    plot.margin = margin(t = 1, r = 1, b = -5, l = 1, unit = "pt"),
+  ) +
+  scale_color_manual("From:", values = as.character(palette.colors()[c(6, 2)])) +
+  scale_fill_manual("From:", values = as.character(palette.colors()[c(6, 2)]))
+ggsave("figures/suppl_fig16.png", width = 16, height = 12, units = "cm", dpi = 300)
+
+# subsets
+export_LM_subset <- plot_data(
+  data = list("male <65" = readRDS("export_relsurv_nedpop_months_male_63_64_LM.rds"),
+              "male 65-69" = readRDS("export_relsurv_nedpop_months_male_65_69_LM.rds"),
+              "male 70-79" = readRDS("export_relsurv_nedpop_months_male_70_79_LM.rds"),
+              "male 80-89" = readRDS("export_relsurv_nedpop_months_male_80_89_LM.rds"),
+              "male 90+" = readRDS("export_relsurv_nedpop_months_male_90plus_LM.rds"),
+              "female <65" = readRDS("export_relsurv_nedpop_months_female_63_64_LM.rds"),
+              "female 65-69" = readRDS("export_relsurv_nedpop_months_female_65_69_LM.rds"),
+              "female 70-79" = readRDS("export_relsurv_nedpop_months_female_70_79_LM.rds"),
+              "female 80-89" = readRDS("export_relsurv_nedpop_months_female_80_89_LM.rds"),
+              "female 90+" = readRDS("export_relsurv_nedpop_months_female_90plus_LM.rds")),
+  start = c(366 - 152, 517 - 152, 609 - 152, 700 - 152), from = state_from,
+  LM_data = T, estimate = "probtrans", sum_aliveMort = T
+)
+
+ggplot(export_LM_subset %>% filter(type == "excess") %>%
+  slice_tail(by = c(name, from, start)) %>% 
+    mutate(
+    from = factor(from, levels = c(
+      "alive event-free", "recent infection", "non-recent infection",
+      "vaccination", "vaccination after infection", "recent infection after vaccination",
+      "non-recent infection after vaccination"
+    )),
+    date = as.Date("2020-06-01") + start,
+    sex = ifelse(grepl("female", name), "Women", "Men"),
+    sex = factor(sex, levels = c("Women", "Men")),
+    age = gsub("female |male ", "", gsub("<65", "63-64", name))
+  )) +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = 0, fill = "grey", alpha = 0.3) +
+  geom_linerange(aes(ymin = CI_low, ymax = CI_upp, color = as.factor(date), x = as.factor(from)),
+    position = position_dodge(width = 0.75), linewidth = 1
+  ) +
+  geom_point(aes(y = prob, color = as.factor(date), x = from),
+    position = position_dodge(width = 0.75)
+  ) +
+  annotate("segment", x = c(1:6) + 0.5, xend = c(1:6) + 0.5, y = -Inf, yend = Inf) +
+  theme_bw() +
+  theme(
+    axis.text = element_text(size = 10, color = "black"), legend.text = element_text(size = 13),
+    axis.title.y = element_text(size = 13),
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 12),
+    axis.title.x = element_blank(),
+    panel.grid.major.x = element_blank(), legend.position = "top",
+    legend.title = element_text(size = 13), strip.text = element_text(size = 12), 
+    plot.margin = margin(t = 1, r = 1, b = 1, l = 1, unit = "pt")
+  ) +
+  facet_grid2(sex ~ age,
+    scales = "free_y", independent = "y"
+  ) +
+  guides(color = guide_legend(title = "Present in state on day:")) +
+  ylab("Probability of excess death until 31 December 2021") +
+  # colorblind-friendly colors:
+  scale_color_manual(values = as.character(palette.colors()[c(2, 3, 6, 8)])) +
+  scale_fill_manual(values = as.character(palette.colors()[c(2, 3, 6, 8)]))
+ggsave("figures/FIG6.png", width = 30, height = 25, units = "cm", dpi = 300)
+
+rbind(export_LM_total %>% filter(type == "excess") %>%
+        slice_tail(by = c(from, start), n = 1) %>% select(name, from, start, prob, CI_low, CI_upp),
+      export_LM_subset %>% filter(type == "excess") %>%
+        slice_tail(by = c(name, from, start), n = 1) %>% select(name, from, start, prob, CI_low, CI_upp)) %>%
+  mutate(value = paste0(formatC(round(prob*100, 2), format = 'f', digits = 2), " (", 
+                        formatC(round(CI_low*100, 2), format = 'f', digits = 2), "-", 
+                        formatC(round(CI_upp*100, 2), format = 'f', digits = 2), ")"),
+         from = factor(from, levels = c("alive event-free", "recent infection", "non-recent infection", "vaccination",
+                                            "vaccination after infection", "recent infection after vaccination",
+                                            "non-recent infection after vaccination")),
+         name = factor(name, levels = c("total","female <65", "male <65", "female 65-69", "male 65-69","female 70-79",
+                                         "male 70-79","female 80-89","male 80-89","female 90+","male 90+"))) %>%
+  pivot_wider(id_cols = c(name, start), names_from = from, values_from = value, names_sort = T) %>%
+  arrange(name,start) %>%
+  openxlsx::write.xlsx("SuppTabl4.xlsx")
+```
+
+```{r excess mortality after vaccination}
+# check positive excess mortality after vaccination (only visible on subset level)
+export_mstate_months_subsets %>%
+  filter(state2 == "excess death after vaccination") %>%
+  filter(prob > 0) %>% # show only all timepoints with positive excess mortality from the vaccination state
+  mutate(
+    name = gsub("male", "Men", gsub("female", "Women", name)),
+    name = factor(name,
+      levels = c(
+        "Women <65", "Men <65", "Women 65-69", "Men 65-69", "Women 70-79",
+        "Men 70-79", "Women 80-89", "Men 80-89", "Women 90+", "Men 90+"
+      )
+    )
+  ) %>%
+  plot_mstate(facet_variable = "name", wrap = 30, use_color = F) +
+  plot_axis(axis.x.text_angle = -45, paths = T) +
+  theme(
+    legend.position = c(0, 0), legend.justification = c(0, 0), text = element_text(size = 12),
+    strip.text = element_text(size = 12), legend.text = element_text(size = 12)
+  )
+
+# vaccination campaign: first frail people, then based on age -> to correctly analyse the excess mortality after vaccination, we need to use the same age groups as used in the vaccination campaign:
+export_mstate_months_birthyear <- plot_data(
+  data = list("<1931" = readRDS("export_relsurv_nedpop_months_before1931.rds"),
+              "1931-1935" = readRDS("export_relsurv_nedpop_months_1931_1935.rds"),
+              "1936-1940" = readRDS("export_relsurv_nedpop_months_1936_1940.rds"),
+              "1941-1946" = readRDS("export_relsurv_nedpop_months_1941_1946.rds"),
+              "1947-1951" = readRDS("export_relsurv_nedpop_months_1947_1951.rds"),
+              "1952" = readRDS("export_relsurv_nedpop_months_1952.rds"),
+              "1953-1955" = readRDS("export_relsurv_nedpop_months_1953_1955.rds"),
+              "1956" = readRDS("export_relsurv_nedpop_months_1956.rds")),
+  levels = c("<1931", "1931-1935", "1936-1940", "1941-1946", "1947-1951", "1952", "1953-1955", "1956"),
+  estimate = "probtrans",
+  hide_BackgroundMort = T
+)
+
+# get limits for plot
+export_mstate_months_birthyear %>%
+  filter(state2 == "excess death after vaccination") %>%
+  mutate(name = factor(name, levels = c(
+    "<1931", "1931-1935", "1936-1940", "1941-1946",
+    "1947-1951", "1952", "1953-1955", "1956"
+  ))) %>%
+  filter(prob > 0) %>% summarise(min(time),max(time), min(CI_low), max(CI_upp)) 
+
+# make plot
+export_mstate_months_birthyear %>%
+  filter(state2 == "excess death after vaccination") %>%
+  mutate(name = factor(name, levels = c(
+    "<1931", "1931-1935", "1936-1940", "1941-1946",
+    "1947-1951", "1952", "1953-1955", "1956"
+  ))) %>%
+  filter(time >= 233 & time <= 346) %>%
+  plot_mstate(facet_variable = "name", wrap = 30, use_color = F) +
+  plot_axis(axis.x.text_angle = -45, paths = T) +
+  theme(
+    legend.position = c(0, 0), legend.justification = c(0, 0), text = element_text(size = 12),
+    strip.text = element_text(size = 12), legend.text = element_text(size = 12),
+    plot.margin = margin(t = 1, r = 13, b = -5, l = 1, unit = "pt")
+  ) +
+  geom_vline(
+    data = data.frame(
+      name = factor(
+        c(
+          "<1931", "1931-1935", "1936-1940", "1941-1946", "1947-1951", "1952", "1953-1955",
+          "1956"
+        ),
+        levels = c(
+          "<1931", "1931-1935", "1936-1940", "1941-1946", "1947-1951",
+          "1952", "1953-1955", "1956"
+        )
+      ),
+      start = as.Date(c(
+        "2021-01-26", "2021-01-29", "2021-02-05", "2021-03-06", "2021-04-06",
+        "2021-04-19", "2021-04-20", "2021-02-15"
+      ))
+    ) %>%
+      mutate(int = as.numeric(start - as.Date("2020-05-31"))),
+    aes(xintercept = int), color = "red"
+  ) +
+  coord_cartesian(ylim = c(-8.265087e-05, 0.0003195704), expand = F)+
+  facet_wrap(~name)
+ggsave("figures/suppl_analysis3.png", width = 20, height = 15, units = "cm", dpi = 300)
+```
+
+# Cumulative incidences
+```{r cuminc}
+#### infection ####
+export_cuminc <- read_xlsx("export_rebuilt.xlsx", "cuminc") %>%
+  pivot_longer(cols = -c(time,model), names_sep = "_", names_to = c("name", "event", "measure")) %>%
+  filter(!is.na(value)) %>% 
+  pivot_wider(id_cols = time:event, names_from = measure, values_from = value) %>%
+  mutate(CI_low = CI - qnorm((1-0.95)/2, lower.tail = F) * seCI,
+         CI_upp = CI + qnorm((1-0.95)/2, lower.tail = F) * seCI,
+         across(c(CI_low, CI_upp), 
+                ~ifelse(is.na(.x), NA, ifelse(.x < 0, 0, ifelse(.x > 1, 1, .x)))))
+
+export_cuminc %>% filter(model == "InfdeathComp" & name == "total") %>% filter(time == max(time)) %>%
+  mutate(across(c(CI,CI_low,CI_upp), ~as.character(round(.x*100, digits = 2))))
+export_cuminc %>% filter(model == "InfdeathComp" & name != "total") %>% filter(time == max(time))
+
+export_cuminc %>% filter(model == "InfdeathComp" & name != "total" & event == "infection") %>%
+  mutate(name = gsub("male", "Men", gsub("female", "Women", gsub("<65", "63-64", name))),
+         name = factor(name, levels = c("Women 63-64", "Men 63-64", "Women 65-69", "Men 65-69", "Women 70-79", "Men 70-79",
+                                        "Women 80-89", "Men 80-89", "Women 90+", "Men 90+"))) %>%
+  ggplot(aes(x = time, y = CI, ymin = CI_low, ymax = CI_upp)) +
+  geom_step(linewidth = 1, aes(color = name)) +
+  geom_step(data = export_cuminc %>% filter(model == "InfdeathComp" & name == "total" & event == "infection"),
+            aes(linetype = name), linewidth = 1, color = "red") +
+  theme_bw() +
+  theme(legend.title = element_blank(), panel.grid = element_blank(), legend.key.width = unit(25, "pt"),
+        plot.margin = margin(t = 1, r = 1, b = -5, l = 1)) +
+  plot_axis(axis.x.text_angle = -45) +
+  coord_cartesian(expand = F) +
+  ylab("Cumulative incidence") +
+  scale_color_viridis_d(direction = -1) +
+  scale_linetype_manual(values = c("total" = "dashed"), labels = c("total" = "Total"))
+ggsave("figures/suppl_fig3.png", width = 25, height = 15, units = "cm", dpi = 300)
+
+#### vaccination #####
+export_cuminc %>% filter(model == "VaccdeathComp" & name == "total") %>% filter(time == max(time)) %>%
+  mutate(across(c(CI,CI_low,CI_upp), ~as.character(round(.x*100, digits = 2))))
+export_cuminc %>% filter(model == "VaccdeathComp" & name != "total")
+
+# get dates of important events for the vaccination campaign to show in the background:
+df_vacc <- data.frame(
+      name = factor(
+        c(
+          "some health care workers", "residents of long-term care facilities", "<1931", "1931-1935", "1936-1940", "1941-1946",
+          "mobile adult medical risk groups", "immobile persons living at home", "1947-1951", "1952", "1953-1955", "1956"),
+        levels = c(
+          "some health care workers", "residents of long-term care facilities", "<1931", "1931-1935", "1936-1940", "1956", "1941-1946",
+          "mobile adult medical risk groups", "immobile persons living at home", "1947-1951",
+          "1952", "1953-1955")
+      ),
+      start = as.Date(c(
+        "2021-01-06", "2021-01-18", "2021-01-26", "2021-01-29", "2021-02-05", "2021-03-06", "2021-03-17", "2021-04-05", "2021-04-06",
+        "2021-04-19", "2021-04-20", "2021-02-15"
+      ))) %>% arrange(start)
+df_vacc
+
+library(cowplot)
+plot_grid(
+  export_cuminc %>% filter(model == "VaccdeathComp" & name != "total" & event == "vaccination") %>%
+    full_join(expand.grid(time = 1:579, name = levels_subset)) %>%
+    mutate(CI = ifelse(is.na(CI) & time == 1, 0, CI), 
+           name = gsub("male", "Men", gsub("female", "Women", gsub("<65", "63-64", name))),
+           name = factor(name, levels = c("Women 63-64", "Men 63-64", "Women 65-69", "Men 65-69", "Women 70-79", "Men 70-79",
+                                          "Women 80-89", "Men 80-89", "Women 90+", "Men 90+"))) %>%
+    arrange(name, time) %>%
+    group_by(name) %>% fill(CI, .direction = "down") %>%
+    ggplot(aes(x = time, y = CI, ymin = CI_low, ymax = CI_upp)) +
+    geom_step(linewidth = 1, aes(color = name)) +
+    geom_step(data = export_cuminc %>% filter(model == "VaccdeathComp" & name == "total" & event == "vaccination") %>%
+                full_join(expand.grid(time = 1:579, name = "total")) %>%
+                arrange(time) %>%
+                mutate(CI = ifelse(is.na(CI) & time == 1, 0, CI)) %>%
+                fill(CI),
+              aes(linetype = name), linewidth = 1, color = "red") +
+    theme_bw() +
+    theme(legend.title = element_blank(), panel.grid = element_blank(), legend.key.width = unit(25, "pt"),
+          plot.margin = margin(t = 1, r = -5, b = -5, l = 1, unit = "pt")) +
+    plot_axis(axis.x.text_angle = -45) +
+    coord_cartesian(xlim = c(1,579), expand = F) +
+    ylab("Cumulative incidence") +
+    scale_color_viridis_d(direction = -1) +
+    scale_linetype_manual(values = c("total" = "dashed"), labels = c("total" = "Total")),
+  ggplot(df_vacc, aes(x = start, y = name)) + 
+    geom_segment(aes(xend = start + 21), arrow = arrow(length = unit(0.02, "npc"), type = "closed"))+
+    geom_segment(aes(yend = Inf, xend = start), linetype = "dotted")+
+    geom_text(vjust = 0, hjust = 0, nudge_y = 0.25, nudge_x = 2, aes(label = name), size = 3)+
+    scale_x_date(limits = c(as.Date("2020-06-01"),as.Date("2021-12-31")), expand = c(0,0))+
+    theme_void()+theme(plot.margin = margin(t = 1, r = 1, b = -5, l = 1, unit = "pt"))+
+    coord_cartesian(clip = "off"),
+  align = "v", nrow = 2, axis = "lr", rel_heights = c(1,0.5))
+ggsave("figures/suppl_fig4.png", width = 25, height = 20, units = "cm", dpi = 300)
+
+#### use method of RIVM ####
+# required for supplemental analysis 1
+read_xlsx("export_rebuilt.xlsx", "vacc") %>%
+  mutate(
+    correctVacc_perc = prop / prop_RIVM,
+    incorrectvacc_perc = (prop_RIVM - prop) / prop_RIVM,
+    no_vacc = 1 - prop,
+    no_vacc_RIVM = 1 - prop_RIVM,
+    incorrectNovacc_perc = (no_vacc - no_vacc_RIVM) / no_vacc
+  ) %>%
+  print(width = Inf)
+```

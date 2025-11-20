@@ -1,0 +1,598 @@
+---
+title: "ratetables"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+date: "`r Sys.Date()`"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(prodlim)
+library(relsurv)
+```
+
+# rate table based on HMD
+get life tables from Human Mortality Database (the Netherlands: mltper_1x1.txt and fltper_1x1.txt)
+- for 2019: use original
+- for 2015-2019: use per age and sex the mean hazards of the 5 years
+
+```{r based on HMD}
+#### ratetable for 2019 ####
+nedpop <- transrate.hmd(male = "mltper_1x1.txt", female = "fltper_1x1.txt")
+
+# create new version with 2020 and 2021 as dimensions, using the hazards of 2019
+nedpop2 <- array( 
+  c(
+    data.frame(
+      age = rep(0:110, 2),
+      h = c(
+        nedpop[, "2019", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2019", "male"] %>% as.matrix() %>% as.data.frame() %>% pull())) %>%
+      filter(as.numeric(age) >= 63) %>%
+      mutate(sex = "male", year = as.Date(c(
+        rep("2020-01-01", 48),
+        rep("2021-01-01", 48)))) %>%
+      group_by(year, age) %>% summarise(h = mean(h), .groups = "drop") %>%
+      pivot_wider(id_cols = "age", values_from = h, names_from = year) %>% 
+      select(-age) %>% as.matrix(),
+    data.frame(
+      age = rep(0:110, 2),
+      h = c(
+        nedpop[, "2019", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2019", "female"] %>% as.matrix() %>% as.data.frame() %>% pull())) %>%
+      filter(as.numeric(age) >= 63) %>%
+      mutate(sex = "female", year = as.Date(c(
+        rep("2020-01-01", 48),
+        rep("2021-01-01", 48)))) %>%
+      group_by(year, age) %>% summarise(h = mean(h), .groups = "drop") %>%
+      pivot_wider(id_cols = "age", values_from = h, names_from = year) %>%
+      select(-age) %>% as.matrix()),
+  dim = c(48, 2, 2))
+attributes(nedpop2) <- list(
+  dim = dim(nedpop2),
+  dimnames = list(
+    "age" = as.character(c(63:110)),
+    "year" = c("2020", "2021"),
+    "sex" = c("male", "female")),
+  dimid = c("age", "year", "sex"),
+  factor = c(0, 0, 1), type = c(2, 3, 1),
+  cutpoints = list((63:110) * 365.241, as.Date(c("2020-01-01", "2021-01-01")), NULL),
+  class = "ratetable")
+saveRDS(nedpop2, "nedpop2.rds")
+
+# visual check
+ggplot(
+  rbind(
+    nedpop[, "2015", ] %>% as.matrix() %>% as.data.frame() %>% mutate(year = 2015),
+    nedpop[, "2016", ] %>% as.matrix() %>% as.data.frame() %>% mutate(year = 2016),
+    nedpop[, "2017", ] %>% as.matrix() %>% as.data.frame() %>% mutate(year = 2017),
+    nedpop[, "2018", ] %>% as.matrix() %>% as.data.frame() %>% mutate(year = 2018),
+    nedpop[, "2019", ] %>% as.matrix() %>% as.data.frame() %>% mutate(year = 2019),
+    nedpop2[, "2020", ] %>% as.matrix() %>% as.data.frame() %>% mutate(year = 2020),
+    nedpop2[, "2021", ] %>% as.matrix() %>% as.data.frame() %>% mutate(year = 2021)) %>%
+    mutate(age = c(rep(0:110, 5), rep(63:110, 2))) %>%
+    pivot_longer(cols = c(male, female), names_to = "sex", values_to = "hazard") %>%
+    filter(age >= 63 & age <= 100),
+  aes(x = year, y = hazard)) +
+  geom_point() +
+  geom_line(aes(group = age, color = age)) +
+  facet_wrap(~sex) +
+  ggtitle("years 2020 and 2021 by using 2019")
+
+#### ratetable with mean hazard 2015-2019 from HMD ####
+nedpop_1519 <- array(
+  c(
+    data.frame(
+      type = "nedpop_15_19", age = rep(0:110, 10),
+      h = c(
+        nedpop[, "2019", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2018", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2017", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2016", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2015", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2019", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2018", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2017", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2016", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2015", "male"] %>% as.matrix() %>% as.data.frame() %>% pull())) %>%
+      filter(as.numeric(age) >= 63) %>%
+      mutate(sex = "male", year = as.Date(c(
+        rep("2020-01-01", 48 * 5),
+        rep("2021-01-01", 48 * 5)))) %>%
+      group_by(year, age) %>% summarise(h = mean(h), .groups = "drop") %>%
+      pivot_wider(id_cols = "age", values_from = h, names_from = year) %>% 
+      select(-age) %>% as.matrix(),
+    data.frame(
+      type = "nedpop_15_19", age = rep(0:110, 5),
+      h = c(
+        nedpop[, "2019", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2018", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2017", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2016", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2015", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2019", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2018", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2017", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2016", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2015", "female"] %>% as.matrix() %>% as.data.frame() %>% pull())) %>%
+      filter(as.numeric(age) >= 63) %>%
+      mutate(sex = "female", year = as.Date(c(
+        rep("2020-01-01", 48 * 5),
+        rep("2021-01-01", 48 * 5)))) %>%
+      group_by(year, age) %>% summarise(h = mean(h), .groups = "drop") %>%
+      pivot_wider(id_cols = "age", values_from = h, names_from = year) %>% 
+      select(-age) %>% as.matrix()),
+  dim = c(48, 2, 2))
+attributes(nedpop_1519) <- list(
+  dim = dim(nedpop_1519),
+  dimnames = list(
+    "age" = as.character(c(63:110)),
+    "year" = c("2020", "2021"),
+    "sex" = c("male", "female")),
+  dimid = c("age", "year", "sex"),
+  factor = c(0, 0, 1), type = c(2, 3, 1),
+  cutpoints = list((63:110) * 365.241, as.Date(c("2020-01-01", "2021-01-01")), NULL),
+  class = "ratetable")
+saveRDS(nedpop_1519, "nedpop_1519.rds")
+```
+
+# based on microdata: hazards fixed during the year
+NB: the reference cohorts also contain those who were exactly 63.0 years old on 1 January, the study cohort (2020-2021) does not consider those who were exactly 63.0 years old on 1 January 2020 (but does consider those who were exactly 63.0 years old on 1 January 2021).
+
+use microdata of the years 2015-2019 to calculate the mean daily mortality hazard per age and sex
+- persons can change age during the year -> start new row at birthday
+- between ages 91-105: use for each age a 5-year shifting window for smoothed survival 
+- for ages >105: combine with age 105 for the '105' age window (relatively small groups)
+- for the 5-year shifting windows: there are more younger than older persons -> reweigh so that each age contributes the same amount
+
+```{r based on microdata - year}
+### 2015-2019 ####
+# distinguish between leap and non-leap years
+# collapse duplicate rows to decrease size of dataset
+
+# full dataset:
+saveRDS(rbind(
+  readRDS("data_2015.rds") %>% select(GBAGESLACHT, BIRTHDAY, srv, srv_s, age_1Jan) %>%
+    mutate(start0 = as.Date("2015-01-01"), year = "other"),
+  readRDS("data_2016.rds") %>% select(GBAGESLACHT, BIRTHDAY, srv, srv_s, age_1Jan) %>%
+    mutate(start0 = as.Date("2016-01-01"), year = "2016"),
+  readRDS("data_2017.rds") %>% select(GBAGESLACHT, BIRTHDAY, srv, srv_s, age_1Jan) %>%
+    mutate(start0 = as.Date("2017-01-01"), year = "other"),
+  readRDS("data_2018.rds") %>% select(GBAGESLACHT, BIRTHDAY, srv, srv_s, age_1Jan) %>%
+    mutate(start0 = as.Date("2018-01-01"), year = "other"),
+  readRDS("data_2019.rds") %>% select(GBAGESLACHT, BIRTHDAY, srv, srv_s, age_1Jan) %>%
+    mutate(start0 = as.Date("2019-01-01"), year = "other")) %>%
+    mutate(sex = ifelse(GBAGESLACHT == "Mannen", "male", "female")) %>%
+    group_by(sex, srv, srv_s, age_1Jan, year, BIRTHDAY, start0) %>%
+    summarise(n = n(), .groups = "drop"), "df_2015_2019_full.rds")
+
+# collapsed dataset:
+df_1519_total <- rbind(readRDS("df_2015_2019_full.rds") %>% # rows until birthday
+                 mutate(dec = floor(age_1Jan) + 1 - age_1Jan,
+                        int = floor(dec*365.241) + 1,
+                        srv_s = ifelse(srv > int, 0, srv_s),
+                        srv = ifelse(srv > int & int != 0, int, srv), 
+                        start = 0,
+                        age = age_1Jan),
+               readRDS("df_2015_2019_full.rds") %>% # rows since birthday
+                 mutate(dec = floor(age_1Jan) + 1 - age_1Jan,
+                        int = floor(dec*365.241) + 1,
+                        start = int,
+                        age = age_1Jan + int/365.241) %>%
+                 filter(srv > int)) %>%
+  mutate(age_old = floor(age), age = age_old) %>%
+  select(sex, age_old, age, n, start, srv, srv_s, year)
+
+df_1519 <- df_1519_total %>% filter(age >= 63 & age <= 90) # start dataframe: ages 63-90
+head(df_1519)
+for (i in c(91:105)) { # add 5-year shifting windows for ages 91-105
+  df_1519 <- rbind(
+    df_1519,
+    df_1519_total %>%
+      filter((age_old >= i - 2 & age_old <= i + 2) | (i == 105 & age_old > 105)) %>%
+      mutate(age = i) %>% select(sex, age_old, age, n, start, srv, srv_s, year))
+}
+head(df_1519)
+df_1519 %>%
+  group_by(age, age_old) %>%
+  summarise(n = sum(n)) %>%
+  filter(age != age_old) %>%
+  group_by(age) %>%
+  mutate(total = sum(n)) %>%
+  print(n = Inf)
+
+df_1519.2 <- df_1519 %>% # reweigh (only matters for age 91-105)
+  mutate(age_old2 = ifelse(age_old > 105, 105, age_old), age = as.character(age), n_old = n) %>%
+  group_by(sex, age_old2, age) %>%
+  mutate(n = sum(n_old)) %>%
+  group_by(sex, age) %>%
+  mutate(
+    total = sum(n_old), prop = n / total,
+    groups = length(unique(age_old2)),
+    weight = ((1 / length(unique(age_old2))) / prop) * n_old) %>%
+  ungroup()
+head(df_1519.2)
+
+# check
+df_1519.2 %>%
+  filter(prop == 1) %>%
+  select(age_old) %>%
+  unique() %>%
+  pull() %>%
+  sort()
+df_1519.2 %>%
+  filter(age == 105 & sex == "male") %>%
+  arrange(sex, age_old2) %>%
+  select(sex, age_old, age_old2, n, total, prop, weight) %>%
+  unique()
+df_1519.2 %>%
+  filter(age == 105 & sex == "male") %>%
+  group_by(age, age_old2, srv_s, n, weight) %>%
+  summarise(rows = n()) %>%
+  mutate(weighted_n = n * weight, weighted_rows = rows * weight) %>%
+  print(n = Inf) 
+
+# calculate mean daily hazard
+df_srv <- survfit(Surv(start, srv, srv_s) ~ sex + age, data = df_1519.2, 
+                  weights = df_1519.2$weight, 
+                  stype = 2) %>% # stype 2 gives exp(cumulative hazard)
+  broom::tidy() %>% filter(time == 365) %>%
+  mutate(strata = gsub("sex=|age=", "", strata)) %>%
+  tidyr::separate_wider_delim(strata, delim=", ", names = c("sex", "age")) %>% 
+  mutate(h = -log(estimate) / 365, age = gsub(" ", "", age)) # calculate mean daily hazard
+head(df_srv)
+
+# add missing ages (fill sex, age)
+df_srv2 <- full_join(
+  expand.grid(
+    age = as.character(c(63:110)),
+    year = as.Date("2020-01-01"),
+    sex = c("male", "female")),
+  df_srv,
+  by = c("sex", "age")) %>%
+  arrange(as.numeric(age)) %>%
+  group_by(sex) %>%
+  fill(h, .direction = "down") %>%
+  ungroup()
+head(df_srv2)
+tail(df_srv2)
+dim(df_srv2)
+
+# create ratetable
+nedpop_year <- array(
+  c(
+    rbind(
+      df_srv2[df_srv2$sex == "male", c("age", "year", "h")],
+      df_srv2[df_srv2$sex == "male", c("age", "year", "h")] %>%
+        mutate(year = as.Date("2021-01-01"))) %>% 
+      filter(as.numeric(age) >= 63) %>%
+      pivot_wider(id_cols = "age", values_from = h, names_from = year) %>%
+      select(-age) %>% as.matrix(),
+    rbind(
+      df_srv2[df_srv2$sex == "female", c("age", "year", "h")],
+      df_srv2[df_srv2$sex == "female", c("age", "year", "h")] %>%
+        mutate(year = as.Date("2021-01-01"))) %>% 
+      filter(as.numeric(age) >= 63) %>%
+      pivot_wider(id_cols = "age", values_from = h, names_from = year) %>%
+      select(-age) %>% as.matrix()),
+  dim = c(48, 2, 2))
+attributes(nedpop_year) <- list(
+  dim = dim(nedpop_year),
+  dimnames = list(
+    "age" = as.character(c(63:110)),
+    "year" = c("2020", "2021"),
+    "sex" = c("male", "female")),
+  dimid = c("age", "year", "sex"),
+  factor = c(0, 0, 1), type = c(2, 3, 1),
+  cutpoints = list(
+    (63:110) * 365.241,
+    as.Date(c("2020-01-01", "2021-01-01")),
+    NULL),
+  class = "ratetable")
+saveRDS(nedpop_year, "nedpop_year.rds")
+
+# visual check: 
+ggplot(
+  data = rbind(
+    data.frame(
+      type = rep("nedpop_year", 48), age = 63:110, sex = rep("male", 48),
+      h = nedpop_year[, "2020", "male"] %>% as.matrix() %>% as.data.frame() %>% pull()),
+    data.frame(
+      type = rep("nedpop_year", 48), age = 63:110, sex = rep("female", 48),
+      h = nedpop_year[, "2020", "female"] %>% as.matrix() %>% as.data.frame() %>% pull()),
+    data.frame(
+      type = "HMD 2015-19", age = rep(0:110, 5), sex = rep("male", 111 * 5),
+      h = c(
+        nedpop[, "2019", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2018", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2017", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2016", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2015", "male"] %>% as.matrix() %>% as.data.frame() %>% pull())) %>%
+      group_by(type, age, sex) %>% summarise(h = mean(h), .groups = "drop"),
+    data.frame(
+      type = "HMD 2015-19", age = rep(0:110, 5), sex = rep("female", 111 * 5),
+      h = c(
+        nedpop[, "2019", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2018", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2017", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2016", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2015", "female"] %>% as.matrix() %>% as.data.frame() %>% pull())) %>%
+      group_by(type, age, sex) %>% summarise(h = mean(h), .groups = "drop")) %>%
+    filter(age >= 63 & age <= 105),
+  aes(x = age, y = h, color = type)) +
+  geom_line(alpha = 0.5) +
+  geom_point(alpha = 0.5) +
+  facet_wrap(~sex, strip.position = "right", scales = "free")
+
+ggplot(
+  data = rbind(
+    data.frame(
+      type = rep("nedpop_year", 48), age = 63:110, sex = rep("male", 48),
+      h = nedpop_year[, "2020", "male"] %>% as.matrix() %>% as.data.frame() %>% pull()),
+    data.frame(
+      type = rep("nedpop_year", 48), age = 63:110, sex = rep("female", 48),
+      h = nedpop_year[, "2020", "female"] %>% as.matrix() %>% as.data.frame() %>% pull()),
+    data.frame(
+      type = "HMD 2015-19", age = rep(0:110, 5), sex = rep("male", 111 * 5),
+      h = c(
+        nedpop[, "2019", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2018", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2017", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2016", "male"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2015", "male"] %>% as.matrix() %>% as.data.frame() %>% pull())) %>%
+      group_by(type, age, sex) %>% summarise(h = mean(h), .groups = "drop"),
+    data.frame(
+      type = "HMD 2015-19", age = rep(0:110, 5), sex = rep("female", 111 * 5),
+      h = c(
+        nedpop[, "2019", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2018", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2017", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2016", "female"] %>% as.matrix() %>% as.data.frame() %>% pull(),
+        nedpop[, "2015", "female"] %>% as.matrix() %>% as.data.frame() %>% pull())) %>%
+      group_by(type, age, sex) %>% summarise(h = mean(h), .groups = "drop")) %>%
+    filter(age >= 100 & age <= 109),
+  aes(x = age, y = h, color = type)) +
+  geom_line(alpha = 0.5) +
+  geom_point(alpha = 0.5) +
+  facet_wrap(~sex, strip.position = "right", scales = "free")
+
+ggplot(df_srv, aes(x = as.numeric(age), y = estimate)) +
+  facet_wrap(~sex) +
+  geom_segment(aes(xend = as.numeric(age), y = conf.low, yend = conf.high)) +
+  geom_point() +
+  ylab("1-year survival")
+ggplot(df_srv, aes(x = as.numeric(age), y = h)) +
+  facet_wrap(~sex) +
+  geom_point() + 
+  ylab("daily hazard")
+```
+
+# per month
+use microdata of the years 2015-2019 to calculate the mean daily mortality hazard per age, sex and month
+- birthdays are always on the first of the month
+- between ages 91-99: use for each age this age +/- 2 years for smoothed survival 
+- for age >105: combine with age 105 (small groups)
+
+```{r based on microdata - month}
+#### 2015-2019 ####
+# split per month, distinguish between leap and non-leap years
+df_survsplit <- rbind(
+  survSplit(Surv(srv, srv_s) ~ sex + age_1Jan + year + n,
+    data = readRDS("df_2015_2019.rds") %>% filter(year != "2016"),
+    cut = cumsum(c(31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)), episode = "month"),
+  survSplit(Surv(srv, srv_s) ~ sex + age_1Jan + year + n,
+    data = readRDS("df_2015_2019.rds") %>% filter(year == "2016"),
+    cut = cumsum(c(31, 28, 1, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)), episode = "month"))
+head(df_survsplit)
+
+table(df_survsplit$tstart, df_survsplit$month)
+df_survsplit %>%
+  filter(srv_s == 0) %>%
+  select(tstart, srv, month, year) %>%
+  unique() %>%
+  mutate(time = srv - tstart)
+
+# remove month 3 of 2016 (29 February), relabel subsequent months
+df_survsplit2 <- df_survsplit %>%
+  as_tibble() %>%
+  filter(!(year == "2016" & month == 3)) %>%
+  mutate(
+    age_old = age_1Jan + (tstart / 365.241), age_old = floor(age_old), age = age_old, 
+    tstart = ifelse(year == "2016" & month > 3, tstart - 1, tstart),
+    srv = ifelse(year == "2016" & month > 3, srv - 1, srv),
+    time = srv - tstart, 
+    month = ifelse(year == "2016" & month > 3, month - 1, month),
+    year = as.Date(paste0("2020-", month, "-01"))) %>%
+  group_by(month) %>%
+  mutate( # duration of each month:
+    duration = max(srv) - tstart) %>%
+  ungroup()
+
+# inspect dataframe
+df_survsplit2
+table(df_survsplit2$tstart, df_survsplit2$month)
+df_survsplit2 %>%
+  filter(srv_s == 0) %>%
+  select(tstart, srv, month, duration, year) %>%
+  unique()
+df_survsplit2 %>%
+  group_by(month, srv_s) %>%
+  summarise(n = sum(n), .groups = "drop") %>%
+  pivot_wider(id_cols = month, values_from = n, names_from = srv_s) %>%
+  mutate(total = `0` + `1`)
+df_survsplit2 %>%
+  select(tstart, duration, month) %>%
+  unique() %>%
+  mutate(date = as.Date("2020-01-01") + tstart)
+
+# for every age >90, combine ages -2y of that age and +2y of that age
+df_survsplit2.2 <- df_survsplit2 %>% # start dataframe with ages 63-90
+  filter(age >= 63 & age <= 90) %>%
+  select(sex, age_old, age, n, time, srv_s, duration, month, year)
+head(df_survsplit2.2)
+for (i in c(91:105)) { # add higher ages
+  df_survsplit2.2 <- rbind(
+    df_survsplit2.2,
+    df_survsplit2 %>%
+      filter((age_old >= i - 2 & age_old <= i + 2) | (i == 105 & age_old > 105)) %>%
+      mutate(age = i) %>% select(sex, age_old, age, n, time, srv_s, duration, month, year))
+}
+tail(df_survsplit2.2)
+df_survsplit2.2 %>%
+  group_by(age, age_old, month, year) %>%
+  summarise(n = sum(n), .groups = "drop") %>%
+  filter(age != floor(age_old) & month == 1 & year == "2020-01-01") %>%
+  group_by(age) %>%
+  mutate(total = sum(n)) %>%
+  print(n = 20)
+
+# reweigh (only matters for ages >90)
+df_survsplit2.3 <- df_survsplit2.2 %>%
+  mutate(age_old2 = ifelse(age_old > 105, 105, age_old),
+         age = as.character(age), n_old = n) %>%
+  group_by(sex, age_old2, age, month, year, duration) %>%
+  mutate(n = sum(n_old)) %>%
+  group_by(sex, age, month, year, duration) %>%
+  mutate(
+    total = sum(n_old), prop = n / total,
+    groups = length(unique(age_old2)),
+    weight = ((1 / length(unique(age_old2))) / prop) * n_old) %>%
+  ungroup()
+df_survsplit2.3 %>%
+  filter(prop == 1) %>%
+  select(age_old2) %>%
+  unique() %>%
+  pull() %>%
+  sort()
+df_survsplit2.3 %>%
+  filter(age == 105 & sex == "male" & month == 1) %>%
+  arrange(sex, time, age_old, age_old2) %>%
+  select(sex, age_old2, age_old, n_old, n, total, prop, weight, time, srv_s) %>%
+  unique() 
+head(df_survsplit2.3)
+
+# calculate mean daily mortality hazard
+df_srv_month <- survfit(Surv(time, srv_s) ~ sex + age + year + duration,
+  data = df_survsplit2.3 %>%
+    mutate(
+      year = as.character(year),
+      duration = as.character(duration)),
+  weights = df_survsplit2.3$weight,
+  stype = 2) %>% # stype 2 gives exp(cumulative hazard)
+  broom::tidy() %>% filter(time %in% unique(df_survsplit2.3$duration)) %>%
+  mutate(strata = gsub("sex=|age=|year=|duration=", "", strata)) %>%
+  tidyr::separate_wider_delim(strata, delim=", ", names = c("sex", "age", "year", "duration")) %>% 
+  filter(time == duration) %>% # keep estimates on last day of each month
+  mutate(year = as.Date(year), 
+         duration = as.numeric(duration), 
+         h = -log(estimate) / duration, # calculate mean daily mortality hazard
+         age = gsub(" ", "", age))
+head(df_srv_month)
+
+# visual checks:
+ggplot(df_srv_month, aes(x = as.numeric(age), y = estimate)) +
+  facet_grid(sex ~ year, scales = "free_y") +
+  geom_segment(aes(xend = as.numeric(age), y = conf.low, yend = conf.high)) +
+  geom_point()+
+  ylab("1-year survival")
+ggplot(df_srv_month, aes(x = year, y = estimate, color = as.numeric(age), group = age)) +
+  facet_wrap(~sex) +
+  geom_point() +
+  geom_line()+
+  ylab("1-year survival")
+ggplot(df_srv_month, aes(x = year, y = std.error, color = as.numeric(age))) +
+  facet_wrap(~sex) +
+  geom_point()+
+  ylab("standard error")
+ggplot(df_srv_month, aes(x = year, y = h, color = as.numeric(age), group = age)) +
+  facet_wrap(~sex) +
+  geom_point() +
+  geom_line()+
+  ylab("daily hazard")
+
+unique(df_srv_month$age)
+# add missing ages (fill sex,age)
+df_srv_month2 <- full_join(
+  expand.grid(
+    age = as.character(c(63:110)),
+    year = as.Date(c(
+      "2020-01-01", "2020-02-01", "2020-03-01", "2020-04-01", "2020-05-01",
+      "2020-06-01", "2020-07-01", "2020-08-01", "2020-09-01", "2020-10-01",
+      "2020-11-01", "2020-12-01")),
+    sex = c("male", "female")),
+  df_srv_month,
+  by = c("sex", "age", "year")) %>%
+  arrange(as.numeric(age)) %>%
+  group_by(sex, year) %>%
+  fill(h, .direction = "down") %>%
+  ungroup()
+head(df_srv_month2)
+tail(df_srv_month2 %>% filter(year == "2020-01-01"))
+dim(df_srv_month2)
+
+df_srv_month3 <- rbind(
+  df_srv_month2,
+  df_srv_month2 %>%
+    mutate(year = as.Date(gsub("2020", "2021", as.character(year)))))
+dim(df_srv_month3)
+tail(df_srv_month3)
+
+# create ratetable
+nedpop_months <- array(
+  c(
+    df_srv_month3[df_srv_month3$sex == "male", c("age", "year", "h")] %>%
+      pivot_wider(id_cols = "age", values_from = h, names_from = year) %>%
+      select(-age) %>% as.matrix(),
+    df_srv_month3[df_srv_month3$sex == "female", c("age", "year", "h")] %>%
+      pivot_wider(id_cols = "age", values_from = h, names_from = year) %>%
+      select(-age) %>% as.matrix()),
+  dim = c(48, 24, 2))
+attributes(nedpop_months) <- list(
+  dim = dim(nedpop_months),
+  dimnames = list(
+    "age" = as.character(c(63:110)),
+    "year" = c(
+      "Jan20", "Feb20", "Mar20", "Apr20", "May20", "Jun20", "Jul20", "Aug20",
+      "Sep20", "Oct20", "Nov20", "Dec20", "Jan21", "Feb21", "Mar21", "Apr21",
+      "May21", "Jun21", "Jul21", "Aug21", "Sep21", "Oct21", "Nov21", "Dec21"),
+    "sex" = c("male", "female")),
+  dimid = c("age", "year", "sex"),
+  factor = c(0, 0, 1), type = c(2, 3, 1),
+  cutpoints = list(
+    (63:110) * 365.241,
+    as.Date(c(
+      "2020-01-01", "2020-02-01", "2020-03-01", "2020-04-01", "2020-05-01",
+      "2020-06-01", "2020-07-01", "2020-08-01", "2020-09-01", "2020-10-01",
+      "2020-11-01", "2020-12-01",
+      "2021-01-01", "2021-02-01", "2021-03-01", "2021-04-01", "2021-05-01",
+      "2021-06-01", "2021-07-01", "2021-08-01", "2021-09-01", "2021-10-01",
+      "2021-11-01", "2021-12-01")),
+    NULL),
+  class = "ratetable")
+attributes(nedpop_months)
+nedpop_months
+nedpop_months["65", , "male"]
+nedpop_months["65", "Jan20", ]
+is.ratetable(nedpop_months, verbose = T) # TRUE
+saveRDS(nedpop_months, "nedpop_months.rds")
+
+# compare with daily hazard per year
+df_srv %>%
+  left_join(df_srv_month3 %>% mutate(h_dur = h * duration) %>% group_by(sex, age) %>%
+    summarise(sum_h = sum(h_dur) / sum(duration))) %>%
+  select(sex, age, h, sum_h) %>%
+  mutate(diff = h - sum_h, perc_diff = diff/h) %>%
+  as_tibble() %>%
+  arrange(perc_diff) %>%
+  print(n = Inf)
+```

@@ -1,0 +1,1654 @@
+---
+title: "analyses - calculations"
+output: 
+  html_document:
+    keep_md: true
+    toc: true
+    toc_float: true
+date: "`r Sys.Date()`"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(mstate)
+library(relsurv)
+library(reshape2)
+```
+
+```{r functions}
+### msfit.relsurv2 ####
+# when doing the analyses for the paper, CBS used an outdated mstate package -> update one line in msfit.relsurv function from the mstate package. (see comment)
+# moreover, the default function does not split transitions to a death state into background/excess if there are no events in that specific transition -> some lines are deactivated in this function to make sure that also these transitions can be split. (see comment)
+msfit.relsurv2 <- function (msfit.obj, data, split.transitions, ratetable = relsurv::slopop, 
+  rmap, time.format = "days", var.pop.haz = c("fixed", "bootstrap", 
+    "both"), B = 10, seed = NULL, add.times, substitution = TRUE, 
+  link_trans_ind = FALSE) 
+{
+  if (!requireNamespace("relsurv", quietly = TRUE)) {
+    stop("Package \"relsurv\" needed for this function to work. Please install it.", 
+      call. = FALSE)
+  }
+  trans1 <- NULL
+  trans2 <- NULL
+  b <- NULL
+  if (!missing(rmap)) {
+    if (substitution) {
+      rmap <- substitute(rmap)
+    }
+  }
+  var.pop.haz <- match.arg(var.pop.haz)
+  bootstrap_ind <- FALSE
+  if (!missing(add.times)) {
+    if (max(add.times) > max(msfit.obj[[1]]$time)) {
+      warning("Maximum value in add.times is bigger than maximum time in dataset. Do you really want to extrapolate the hazards? \n")
+    }
+    add.times <- add.times[!(add.times %in% msfit.obj[[1]]$time)]
+    msfit.new <- msfit.obj[[1]][0, ]
+    for (tr in unique(msfit.obj[[1]]$trans)) {
+      msfit_tmp <- subset(msfit.obj[[1]], trans == tr)
+      msfit_tmp_2 <- data.frame(time = add.times, Haz = NA, 
+        trans = tr)
+      msfit_tmp <- rbind(msfit_tmp, msfit_tmp_2)
+      msfit_tmp <- msfit_tmp[order(msfit_tmp$time), ]
+      msfit_tmp$Haz <- NAfix(msfit_tmp$Haz, 0)
+      msfit.new <- rbind(msfit.new, msfit_tmp)
+    }
+    msfit.obj[[1]] <- msfit.new
+    if (length(msfit.obj) == 3) {
+      msfit.new <- msfit.obj[[2]][0, ]
+      trans.grid <- unique(msfit.obj[[2]][, c("trans1", 
+        "trans2")])
+      for (tr in 1:nrow(trans.grid)) {
+        msfit_tmp <- subset(msfit.obj[[2]], (trans1 == 
+          trans.grid[tr, "trans1"] & trans2 == trans.grid[tr, 
+          "trans2"]))
+        msfit_tmp_2 <- data.frame(time = add.times, 
+          varHaz = NA, trans1 = trans.grid[tr, "trans1"], 
+          trans2 = trans.grid[tr, "trans2"])
+        msfit_tmp <- rbind(msfit_tmp, msfit_tmp_2)
+        msfit_tmp <- msfit_tmp[order(msfit_tmp$time), 
+          ]
+        msfit_tmp$varHaz <- NAfix(msfit_tmp$varHaz, 
+          0)
+        msfit.new <- rbind(msfit.new, msfit_tmp)
+      }
+      msfit.obj[[2]] <- msfit.new
+    }
+  }
+  Haz <- msfit.obj[[1]]
+  if (length(msfit.obj) == 3) {
+    varHaz <- msfit.obj[[2]]
+  }
+  Year <- 365.241
+  Month <- Year/12
+  data_orig <- data
+  time.format.orig <- time.format
+  if (time.format == "days") {
+    if (max(msfit.obj[[1]]$time) < 30) 
+      warning("Your max time in the data is less than 30 days. If time is not stored in days, please use argument time.format. \n")
+  }
+  else if (time.format == "years") {
+    if (max(msfit.obj[[1]]$time) > 100) 
+      warning("Your max time in the data is more than 100 years. If time is not stored in years, please use argument time.format. \n")
+    data$Tstart <- data$Tstart * Year
+    data$Tstop <- data$Tstop * Year
+    data$time <- data$time * Year
+    Haz$time <- Haz$time * Year
+    if (exists("varHaz")) 
+      varHaz$time <- varHaz$time * Year
+    time.format <- "days"
+  }
+  else if (time.format == "months") {
+    if (max(msfit.obj[[1]]$time) > 600) 
+      warning("Your max time in the data is more than 600 months. If time is not stored in months, please use argument time.format. \n")
+    data$Tstart <- data$Tstart * Month
+    data$Tstop <- data$Tstop * Month
+    data$time <- data$time * Month
+    Haz$time <- Haz$time * Month
+    if (exists("varHaz")) 
+      varHaz$time <- varHaz$time * Month
+    time.format <- "days"
+  }
+  else {
+    stop("Argument time.format should take values in c('days', 'years', 'months').")
+  }
+  Haz_new <- Haz[0, ]
+  if (length(msfit.obj) == 3) {
+    trans <- msfit.obj[[3]]
+  }
+  else {
+    trans <- msfit.obj[[2]]
+  }
+  if (missing(split.transitions)) 
+    stop("Please define split.transitions.")
+  else {
+    if (class(split.transitions) == "numeric") {
+      if (!all(split.transitions %in% 1:max(trans, na.rm = TRUE))) 
+        stop("Invalid transitions used inside argument split.transitions.")
+    }
+    else stop("Argument split.transitions expects values of class numeric")
+    for (i in split.transitions) {
+      tmp_state <- which(trans == i, arr.ind = TRUE)[2]
+      if (!all(is.na(trans[tmp_state, ]))) 
+        stop("You've listed an intermediate transition for which the hazard would have to be split in excess and population hazard. Population mortality tables for intermediate events haven't been implemented in this function. Please include only transitions that go to death states in the split.transitions argument.")
+    }
+  }
+  trans_new <- modify_transMat(trans, split.transitions)
+  transitions <- which(!is.na(trans), arr.ind = TRUE)
+  link_trans <- list()
+  for (i in 1:nrow(transitions)) {
+    trans_1 <- trans[transitions[i, 1], transitions[i, 2]]
+    if (!(trans_1 %in% split.transitions)) {
+      trans_2 <- trans_new[rownames(trans)[transitions[i, 
+        1]], colnames(trans)[transitions[i, 2]]]
+      link_trans[[trans_1]] <- trans_2
+      df_tmp <- msfit.obj[[1]][msfit.obj[[1]]$trans == 
+        trans_1, ]
+      df_tmp$trans <- trans_2
+      Haz_new <- rbind(Haz_new, df_tmp)
+    }
+    else {
+      trans_2 <- c(trans_new[rownames(trans)[transitions[i, 
+        1]], paste0(colnames(trans)[transitions[i, 2]], 
+        ".p")], trans_new[rownames(trans)[transitions[i, 
+        1]], paste0(colnames(trans)[transitions[i, 2]], 
+        ".e")])
+      link_trans[[trans_1]] <- trans_2
+      df_p <- Haz[Haz$trans == trans_1, ]
+      df_e <- Haz[Haz$trans == trans_1, ]
+      df_subset <- data[(data$from == transitions[i, 1]) & 
+        (data$to == transitions[i, 2]), ]
+      wh_jump <- which.max(df_e$Haz > 0)
+      is_jump <- any(df_e$Haz > 0)
+      # these lines below are inactivated so that also death transitions without any events can be split into excess and background
+      # if (!is_jump) {
+      #   if (!(link_trans_ind == TRUE & substitution == 
+      #     FALSE)) {
+      #     stop(paste0("There are no events occurring in transition ", 
+      #       trans_1, ". Please remove it from the split.transitions argument."))
+      #   }
+      # }
+      if (nrow(df_subset) == 0 | nrow(df_p) == 0) {
+        if (nrow(df_p) > 0) {
+          df_p$trans <- trans_2[1]
+          df_e$trans <- trans_2[2]
+        }
+      }
+      else {
+        Hazs <- haz_function(Surv(Tstop, status) ~ 1, 
+          data = df_subset, ratetable = ratetable, rmap = rmap, 
+          add.times = df_p$time, include.all.times = FALSE)
+        wh <- which(Hazs$time %in% (df_p$time))
+        wh_l <- c(NA, wh[1:(length(wh) - 1)]) + 1
+        wh_l[1] <- 1
+        haz.pop <- sapply(1:length(wh), function(x) sum(Hazs$haz.pop[wh_l[x]:wh[x]]))
+        haz.excess <- sapply(1:length(wh), function(x) sum(Hazs$haz.excess[wh_l[x]:wh[x]]))
+        df_p$trans <- trans_2[1]
+        df_p$Haz <- cumsum(haz.pop)
+        df_e$trans <- trans_2[2]
+        df_e$Haz <- df_e$Haz - df_p$Haz
+        old_times <- msfit.obj[[1]]$time[msfit.obj[[1]]$trans == 
+          trans_1]
+        df_p$time <- old_times
+        df_e$time <- old_times
+        if (wh_jump < nrow(df_e) & substitution & any(df_e$Haz[(wh_jump + 
+          1):nrow(df_e)] < 0)) {
+          warning(paste0("The relative survival assumption that the observed hazard can be split in population and excess components might not hold for transition ", 
+            trans_1, ". Please check the estimated hazards. Consider removing transition ", 
+            trans_1, " from the split.transitions argument. \n"))
+        }
+      }
+      Haz_new <- rbind(Haz_new, df_p, df_e)
+    }
+  }
+  ordering <- order(Haz_new[, "trans"])
+  Haz_new <- Haz_new[ordering, , drop = FALSE]
+  rownames(Haz_new) <- 1:nrow(Haz_new)
+  if (length(msfit.obj) == 3) {
+    if (sum(var.pop.haz %in% c("fixed", "bootstrap", "both")) == 
+      0) {
+      stop("Argument var.pop.haz should take value 'fixed', 'bootstrap' or 'both'.")
+    }
+    if (var.pop.haz == "fixed" | var.pop.haz == "both") {
+      varHaz_new <- varHaz.fixed(varHaz, link_trans, varHaz_original = msfit.obj[[2]])
+    }
+    if (var.pop.haz == "bootstrap" | var.pop.haz == "both") {
+      set.seed(seed)
+      all_times <- Haz_new[, c("trans", "time")]
+      colnames(all_times)[2] <- "Tstop"
+      haz_boot <- msboot.relsurv(theta = msboot.relsurv.boot, 
+        data = data_orig, id = colnames(data_orig)[1], 
+        B = B, verbose = 0, transmat = trans, all_times = all_times, 
+        split.transitions = split.transitions, rmap = rmap, 
+        time.format = time.format.orig, boot_orig_msfit = FALSE, 
+        ratetable = ratetable, add.times = add.times)
+      haz_boot_df <- do.call(rbind.data.frame, haz_boot)
+      no_samples <- table(unique(haz_boot_df[, c("trans", 
+        "b")])$trans)
+      if (any(no_samples < 2) | (!identical(as.integer(names(no_samples)), 
+        sort(as.integer(stats::na.omit(as.vector(trans_new))))))) {
+        stop("Not enough bootstrap samples so that the variances can be estimated. Please increase value in argument B.")
+      }
+      haz_boot2 <- aggregate(. ~ time + trans, data = subset(haz_boot_df, 
+        select = -b), FUN = stats::var)
+      colnames(haz_boot2)[3] <- "varHaz"
+      haz_boot3 <- haz_boot2
+      haz_boot3$trans1 <- haz_boot3$trans
+      colnames(haz_boot3)[2] <- "trans2"
+      haz_boot3 <- haz_boot3[, c("time", "varHaz", "trans1", 
+        "trans2")]
+      if (var.pop.haz == "both") 
+        varHaz_new <- rbind(data.frame(varHaz_new, var.pop.haz = "fixed"), 
+          data.frame(haz_boot3, var.pop.haz = "bootstrap"))
+      else varHaz_new <- haz_boot3
+      bootstrap_ind <- TRUE
+    }
+    ordering <- order(as.vector(as.matrix(varHaz_new[, c("trans1", "trans2")]))) # changed based on version 0.3.3 (CBS currently only has mstate 0.3.2)
+    varHaz_new <- varHaz_new[ordering, , drop = FALSE]
+    varHaz_new <- stats::na.omit(varHaz_new)
+    rownames(varHaz_new) <- 1:nrow(varHaz_new)
+  }
+  if (length(msfit.obj) == 3) {
+    res <- list(Haz = Haz_new, varHaz = varHaz_new, trans = trans_new)
+  }
+  else {
+    res <- list(Haz = Haz_new, trans = trans_new)
+  }
+  if (link_trans_ind) 
+    res$link_trans <- link_trans
+  if (bootstrap_ind) 
+    res$Haz.boot <- haz_boot
+  class(res) <- "msfit"
+  return(res)
+}
+
+
+### calculate probtrans ####
+# helper functions to combine all necessary steps to calculate hazards and probabilities (data preparation, cox, msfit and probtrans)
+
+# landmark analyses (will be called in func_mstate()):
+LM_mstate <- function(msdata, LM, from, min, relsurv = F, split.transitions,
+                      time.format, var.pop.haz, ratetable) {
+  ms <- cutLMms(msdata, LM = LM) # cut msprep object on landmark time
+  store <- vector("list", length(from))
+  names(store) <- paste0("from_", from)
+  for (i in from) { # repeat analysis from each relevant state
+    from_name <- rownames(attr(ms, "trans"))[i]
+    message(paste("      from:", i))
+    ms2 <- ms %>% # select all persons at risk
+      group_by(across(1)) %>%
+      filter(any(from == i & Tstart == LM)) %>%
+      ungroup() 
+    
+    # save accessible death states
+    death_states <- which(rownames(attr(msdata, "trans")) %in% rownames(attr(msdata, "trans"))[grepl("death", rownames(attr(msdata, "trans")))])
+    death_states <- death_states[death_states %in% ms2$to]
+    
+    ms2 <- ms2 %>%
+      filter(trans %in% trans[status == 1 | to %in% death_states]) %>% # keep only transitions with at least 1 event OR if 'to' is in death_states
+      mutate(
+        Tstart_old = Tstart, Tstop_old = Tstop,
+        Tstart = Tstart - LM, Tstop = Tstop - LM # recalculate Tstart and Tstop values
+      )
+    n <- nrow(unique(ms2[, 1]))
+    if (n >= min) { # LM: create new transition matrix excluding unused states/transitions (unless they are accessible death states/transitions)
+      tmat_old <- attr(ms, "trans")
+      used_states <- ms2 %>%
+        filter(status == 1 | to %in% death_states) %>%
+        count(from, to, trans) %>%
+        pivot_longer(cols = c(from, to)) %>%
+        arrange(value) %>%
+        pull(value) %>%
+        unique()
+      
+      # create new transition matrix based on which states/transitions are still present
+      tmat_new <-
+        tra2trans(!(is.na(tmat_old)) &
+          tmat_old %in% ms2$trans[ms2$status == 1 | ms2$to %in% death_states])[used_states, used_states]
+      rownames(tmat_new) <- rownames(tmat_old)[sort(unique(c(ms2$from, ms2$to)))]
+      colnames(tmat_new) <- colnames(tmat_old)[sort(unique(c(ms2$from, ms2$to)))]
+      ms2 <- ms2 %>% rename(from_old = from, to_old = to, trans_old = trans)
+      ms2 <- ms2 %>% # replace from, to and trans
+        left_join(data.frame(trans_old = sort(unique(ms2$trans_old))) %>%
+          mutate(trans = 1:n()), by = "trans_old") %>%
+        left_join(data.frame(from_old = sort(unique(c(ms2$from_old, ms2$to_old)))) %>%
+          mutate(from = 1:n()), by = "from_old") %>%
+        left_join(data.frame(to_old = sort(unique(c(ms2$from_old, ms2$to_old)))) %>%
+          mutate(to = 1:n()), by = "to_old")
+      attr(ms2, "trans") <- tmat_new # replace transition matrix
+      from_new <- unique(ms2$from[ms2$from_old == i]) # get new 'from' variable
+      
+      # calculate cox and msfit objects (currently only non-parametric)
+      cox <- coxph(Surv(Tstart, Tstop, status) ~ strata(trans), data = ms2, method = "breslow")
+      fit <- msfit(cox, vartype = "greenwood", trans = tmat_new)
+      if (relsurv == T) { # msfit.relsurv2 in case relative survival is needed
+        split_transitions <- melt(tmat_new) %>% # get the new split transition numbers
+          left_join(melt(tmat_old) %>%
+            filter(!is.na(value) & value %in% split.transitions) %>%
+            rename(split = value), by = c("Var1" = "from", "Var2" = "to")) %>%
+          filter(!is.na(value) & !is.na(split)) %>%
+          select(value) %>%
+          pull()
+        if (length(split_transitions) > 0) {
+          mod <- msfit.relsurv2( 
+            msfit.obj = fit,
+            data = ms2 %>%
+              mutate(
+                year = year + LM,
+                age = age + LM
+              ),
+            split.transitions = split_transitions,
+            ratetable = ratetable,
+            time.format = time.format, var.pop.haz = var.pop.haz
+          )
+          # calculate probabilities
+          prob <- probtrans(mod,
+            predt = 0, direction = "forward",
+            method = "greenwood", covariance = T
+          )
+        }
+        store[[paste0("from_", i)]] <- list(LM, n, mod, prob, i, from_new, from_name)
+        names(store[[paste0("from_", i)]]) <-
+          c("LM", "n", "mod", "prob", "from_old", "from_new", "from_old_name")
+      } else { # calculate probabilities without relative survival
+        prob <- probtrans(fit,
+          predt = 0, direction = "forward",
+          method = "greenwood", covariance = T
+        )
+        store[[paste0("from_", i)]] <- list(LM, n, fit, prob, i, from_new, from_name)
+        names(store[[paste0("from_", i)]]) <-
+          c("LM", "n", "msf", "prob", "from_old", "from_new", "from_old_name")
+      }
+    } else { # in case not enough persons at risk
+      store[[paste0("from_", i)]] <- list(LM, n, "from_old_name")
+      names(store[[paste0("from_", i)]]) <- c("LM", "n", from_name)
+    }
+  }
+  return(store)
+}
+
+# main helper function (it saves an .RDS file with all necessary information (hazards, probabilities, from which states and landmark times the predictions are made, etc.))
+func_mstate <- function(msdata, trans = NA,
+                        strata = NA, total = T,
+                        LM = 0, LM_type = "mstate", # options: both, mstate, LM
+                        from = 1, min = 40,
+                        survival_type = "observed", # options: both, observed, relsurv
+                        ratetable = NA, ratetable_name = NA, split.transitions = NA,
+                        time.format = "days", var.pop.haz = "fixed", suffix = "") {
+  if (is.null(attr(msdata, "trans"))) {
+    if (any(!is.na(trans))) {
+      attr(msdata, "trans") <- trans
+    } else {
+      stop("trans missing in msdata and trans argument")
+    }
+  }
+  if (survival_type %in% c("both", "relsurv") & any(is.na(split.transitions))) {
+    stop("relsurv requested but split.transitions missing")
+  }
+  if (survival_type %in% c("both", "relsurv") & is.na(ratetable_name)) {
+    stop("relsurv requested but ratetable_name missing")
+  }
+  # set data structure for subset analyses
+  if (any(!is.na(strata))) {
+    df_subset <- msdata %>%
+      select(all_of(strata)) %>%
+      pivot_longer(everything(), names_to = "strata", values_to = "subset") %>%
+      unique()
+  } else {
+    df_subset <- data.frame(strata = character(), subset = character())
+  }
+  if (total == T) {
+    df_subset <- df_subset %>%
+      add_row(strata = "total", subset = "")
+  }
+  # start calculations
+  for (k in 1:nrow(df_subset)) {
+    message(paste("calculating for:", df_subset$strata[k], df_subset$subset[k]))
+    if (df_subset$strata[k] == "total") {
+      msdata2 <- msdata
+    } else {
+      msdata2 <- msdata[msdata[, df_subset$strata[k]] == df_subset$subset[k], ]
+    }
+    if (LM_type != "LM" | 0 %in% LM) { # non-landmark analyses (from time = 0 or prediction)
+      # calculate transition-specific Cox models
+      cox <- coxph(Surv(Tstart, Tstop, status) ~ strata(trans),
+        data = msdata2, method = "breslow"
+      )
+      # calculate cumulative hazards for each transition
+      msf <- msfit(cox, vartype = "greenwood", trans = attr(msdata2, "trans"))
+      if (survival_type %in% c("both", "relsurv")) { 
+        # split death transitions into background/excess using relative survival
+        mod <- msfit.relsurv2( 
+          msfit.obj = msf, data = msdata2,
+          split.transitions = split.transitions,
+          ratetable = ratetable,
+          time.format = time.format,
+          var.pop.haz = var.pop.haz
+        )
+      }
+      # calculate probabilities
+      prob <- vector("list", length = ifelse(LM_type == "mstate", length(LM), 1))
+      names(prob) <- paste0("time", ifelse(LM_type == "mstate", LM, 0))
+      prob_relsurv <- vector("list", length = ifelse(LM_type == "mstate", length(LM), 1))
+      names(prob_relsurv) <- paste0("time", ifelse(LM_type == "mstate", LM, 0))
+      for (t in LM) {
+        if (t == 0 | LM_type != "LM") {
+          message(paste("   predt:", t))
+          if (survival_type %in% c("both", "observed")) {
+            prob[[paste0("time", t)]] <-
+              probtrans(msf, predt = t, method = "greenwood", covariance = T)
+          }
+          if (survival_type %in% c("both", "relsurv")) {
+            prob_relsurv[[paste0("time", t)]] <-
+              probtrans(mod, predt = t, method = "greenwood", covariance = T)
+          }
+        }
+      }
+      # save objects
+      if (survival_type %in% c("both", "observed")) {
+        saveRDS(
+          list(haz = msf, prob = prob),
+          paste0(
+            "list_mstate", "_",
+            gsub(
+              "total_", "total",
+              gsub(
+                " |-", "_",
+                gsub(
+                  "\\+", "plus",
+                  gsub(
+                    "<", "below",
+                    gsub(
+                      ">", "above",
+                      paste(
+                        df_subset$strata[k],
+                        df_subset$subset[k]
+                      )
+                    )
+                  )
+                )
+              )
+            ),
+            ifelse(suffix != "", paste0("_", suffix), ""), ".rds"
+          )
+        )
+      }
+      if (survival_type %in% c("both", "relsurv")) {
+        saveRDS(
+          list(haz = mod, prob = prob_relsurv),
+          paste0(
+            "list_mstate_relsurv_", ratetable_name, "_",
+            gsub(
+              "total_", "total",
+              gsub(
+                " |-", "_",
+                gsub(
+                  "\\+", "plus",
+                  gsub(
+                    "<", "below",
+                    gsub(
+                      ">", "above",
+                      paste(
+                        df_subset$strata[k],
+                        df_subset$subset[k]
+                      )
+                    )
+                  )
+                )
+              )
+            ),
+            ifelse(suffix != "", paste0("_", suffix), ""), ".rds"
+          )
+        )
+      }
+    }
+    if (LM_type != "mstate" & any(LM > 0)) { # use LM_mstate for landmark analyses
+      LMlist <- vector("list", length = length(LM[LM != 0]))
+      names(LMlist) <- paste0("time", LM[LM != 0])
+      if (survival_type %in% c("both", "observed")) {
+        for (t in LM[LM != 0]) {
+          message(paste("   LM observed:", t))
+          LMlist[[paste0("time", t)]] <-
+            LM_mstate(msdata = msdata2, LM = t, from = from, min = min, relsurv = F)
+        }
+        saveRDS(
+          LMlist,
+          paste0(
+            "list_mstate_",
+            gsub(
+              "total_", "total",
+              gsub(
+                " |-", "_",
+                gsub(
+                  "\\+", "plus",
+                  gsub(
+                    "<", "below",
+                    gsub(
+                      ">", "above",
+                      paste(df_subset$strata[k], df_subset$subset[k])
+                    )
+                  )
+                )
+              )
+            ),
+            ifelse(suffix != "", paste0("_", suffix), ""), "_LM.rds"
+          )
+        )
+      }
+      if (survival_type %in% c("both", "relsurv")) {
+        for (t in LM[LM != 0]) {
+          message(paste("   LM relsurv:", t))
+          LMlist[[paste0("time", t)]] <-
+            LM_mstate(
+              msdata = msdata2, LM = t, from = from, min = min, relsurv = T,
+              split.transitions = split.transitions, ratetable = ratetable,
+              time.format = time.format, var.pop.haz = var.pop.haz
+            )
+        }
+        saveRDS(
+          LMlist,
+          paste0(
+            "list_mstate_relsurv_", ratetable_name, "_",
+            gsub(
+              "total_", "total",
+              gsub(
+                " |-", "_",
+                gsub(
+                  "\\+", "plus",
+                  gsub(
+                    "<", "below",
+                    gsub(
+                      ">", "above",
+                      paste(
+                        df_subset$strata[k],
+                        df_subset$subset[k]
+                      )
+                    )
+                  )
+                )
+              )
+            ),
+            ifelse(suffix != "", paste0("_", suffix), ""), "_LM.rds"
+          )
+        )
+      }
+    }
+  }
+}
+```
+
+```{r data}
+data_2020_2021 <- readRDS("data_2020_2021.rds") %>%
+  mutate(
+    sex = ifelse(GBAGESLACHT == "Mannen", "male", "female"),
+    age = age_1Jan20 * 365.241 - 1, # age on 31 December 2019 (time 0)
+    age_group = case_when(
+      age_1Jan20 < 65 ~ "<65",
+      age_1Jan20 < 70 ~ "65-69",
+      age_1Jan20 < 80 ~ "70-79",
+      age_1Jan20 < 90 ~ "80-89",
+      T ~ "90+"
+    ),
+    sex_age = paste(sex, age_group)
+  )
+
+levels_subset <- c(
+  "female <65", "female 65-69", "female 70-79", "female 80-89", "female 90+",
+  "male <65", "male 65-69", "male 70-79", "male 80-89", "male 90+"
+)
+```
+
+# total excess mortality
+For probability of total excess mortality, use msfit.relsurv2() instead of cmp.rel(), since we have delayed entry for immigrants (not yet implemented in cmp.rel())
+- scale is in days
+- year is start date (31 December 2019 or 31 May 2020 (so that 1 January and 1 June are time 1))
+- sex is sex
+- age is age_1Jan*365.241 - 1 (must be in days)
+- for 2-year analyses: use same background hazards (already implemented in the ratetables)
+
+```{r total excess mortality - preparation}
+# probtrans (needed to translate hazards of msfit.relsurv2 to probabilities) requires at least 2 competing states
+# treating censored patients as having an event doesn't matter if it only occurs on the last day of follow-up
+tmat_srv <- transMat(
+  list(
+    c(2, 3),
+    c(),
+    c()
+  ),
+  names = c("alive", "death", "censor")
+)
+tmat_srv
+
+# prepare data in msprep format (needed for mstate)
+ms_srv <- data_2020_2021 %>%
+  mutate(from = 1, to = 2, trans = 1, time = srv - entry) %>%
+  rename(Tstart = entry, Tstop = srv, status = srv_s) %>%
+  select(RINPERSOON, from, to, trans, Tstart, Tstop, time, status, sex, age_1Jan20, sex_age)
+head(ms_srv)
+ms_srv2 <- rbind(
+  ms_srv,
+  ms_srv %>% mutate(to = 3, trans = 2, status = ifelse(status == 0 & Tstop == 731, 1, 0))
+  ) %>%
+  arrange(RINPERSOON, trans)
+attr(ms_srv2, "trans") <- tmat_srv
+class(ms_srv2) <- c("msdata", "data.frame")
+events(ms_srv2)
+table(data_2020_2021$srv_s) # OK
+
+# get numbers at risk
+df_ms_counts_srv <- ms_srv2 %>%
+  mutate(
+    LM_0 = ifelse(Tstart <= 0 & Tstop > 0, 1, 0),
+    LM_152 = ifelse(Tstart <= 152 & Tstop > 152, 1, 0),
+    LM_366 = ifelse(Tstart <= 366 & Tstop > 366, 1, 0)
+  ) %>%
+  pivot_longer(cols = c(starts_with("LM")), names_to = "start", values_to = "present") %>%
+  filter(present == 1) %>%
+  mutate(start = as.numeric(gsub("LM_", "", start))) %>%
+  select(RINPERSOON, from, sex_age, start) %>%
+  unique() %>%
+  group_by(start, from, sex_age) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  left_join(data.frame(state = rownames(tmat_srv), from = 1:length(rownames(tmat_srv))),
+    by = "from"
+  ) %>%
+  mutate(LM = as.Date("2020-01-01") + start)
+saveRDS(df_ms_counts_srv, "df_ms_counts_srv.rds")
+head(df_ms_counts_srv)
+df_ms_counts_srv %>%
+  group_by(start, state) %>%
+  summarise(sum = sum(n), .groups = "drop") %>%
+  filter(sum >= 10) %>%
+  pivot_wider(id_cols = state, names_from = start, values_from = sum)
+df_ms_counts_srv %>%
+  filter(n >= 10) %>%
+  pivot_wider(id_cols = c(sex_age, state), names_from = start, values_from = n)
+```
+
+## Estimate pandemic-related mortality using default method: HMD (year: 2019, country: NL)
+```{r HMD 2019}
+# use readRDS("nedpop2.rds"): adjusted ratetable with hazards of 2019 for the years 2020 and 2021
+func_mstate(
+  msdata = ms_srv2 %>%
+    mutate(
+      year = as.Date("2019-12-31"),
+      age = age_1Jan20 * 365.241 - 1
+    ),
+  trans = attr(ms_srv2, "trans"),
+  strata = "sex_age",
+  LM = c(0, 152, 366), LM_type = "LM", survival_type = "both",
+  ratetable = readRDS("nedpop2.rds"), ratetable_name = "nedpop2",
+  split.transitions = 1, time.format = "days", var.pop.haz = "fixed", suffix = "srv"
+)
+unique(warnings())
+```
+
+## Estimate pandemic-related mortality using mean HMD values for 2015-2019
+```{r HMD 2015-2019}
+# use readRDS("nedpop_1519.rds"): adjusted ratetable with mean hazards of 2015-2019 for the years 2020 and 2021
+func_mstate(
+  msdata = ms_srv2 %>%
+    mutate(
+      year = as.Date("2019-12-31"),
+      age = age_1Jan20 * 365.241 - 1
+    ),
+  trans = attr(ms_srv2, "trans"),
+  strata = "sex_age",
+  LM = c(0, 152, 366), LM_type = "LM", survival_type = "relsurv",
+  ratetable = readRDS("nedpop_1519.rds"), ratetable_name = "nedpop_1519",
+  split.transitions = 1, time.format = "days", var.pop.haz = "fixed", suffix = "srv"
+)
+unique(warnings())
+```
+
+# Estimate pandemic-related mortality using ratetable based on microdata: hazard per sex and age
+```{r year}
+# use readRDS("nedpop_year.rds"): ratetable with calculated background hazards per sex and age
+func_mstate(
+  msdata = ms_srv2 %>%
+    mutate(
+      year = as.Date("2019-12-31"),
+      age = age_1Jan20 * 365.241 - 1
+    ),
+  trans = attr(ms_srv2, "trans"),
+  strata = "sex_age",
+  LM = c(0, 152, 366), LM_type = "LM", survival_type = "relsurv",
+  ratetable = readRDS("nedpop_year.rds"), ratetable_name = "nedpop_year",
+  split.transitions = 1, time.format = "days", var.pop.haz = "fixed", suffix = "srv"
+)
+unique(warnings())
+``` 
+
+## Estimate pandemic-related mortality using ratetable based on microdata: per sex, age and month
+```{r month}
+# use readRDS("nedpop_months.rds"): ratetable with calculated background hazards per sex, age and month
+func_mstate(
+  msdata = ms_srv2 %>%
+    mutate(
+      year = as.Date("2019-12-31"),
+      age = age_1Jan20 * 365.241 - 1
+    ),
+  trans = attr(ms_srv2, "trans"),
+  strata = "sex_age",
+  LM = c(0, 152, 366), LM_type = "LM", survival_type = "relsurv",
+  ratetable = readRDS("nedpop_months.rds"), ratetable_name = "nedpop_months",
+  split.transitions = 1, time.format = "days", var.pop.haz = "fixed", suffix = "srv"
+)
+unique(warnings())
+``` 
+
+# Multi-state model
+
+## build multi-state model
+```{r prepare multi-state model}
+# how many infection states are needed?
+sort(names(df_infect_vacc2_w))
+# after vaccination: infect 1-2, rec 1-2
+# before any vaccination: infect 1-3, rec 1-3
+
+# build multi-state model structure
+tmat3 <- transMat(
+  list(
+    c(2, 3, 4),   # 1 alive event-free
+    c(5, 6),      # 2 vaccination
+    c(7, 8, 9),   # 3 infection 1
+    c(),          # 4 death event-free
+    c(10, 11),    # 5 infection 1 after vaccination
+    c(),          # 6 death after vaccination
+    c(8, 12, 13), # 7 recovery after infection 1
+    c(5, 14),     # 8 vaccination after infection (day of vaccination, possibly before recovery is reached)
+    c(),          # 9 death after infection
+    c(15, 16),    # 10 recovery after infection 1 after vaccination
+    c(),          # 11 death after infection after vaccination
+    c(8, 9, 17),  # 12 infection 2
+    c(),          # 13 death after recovery after infection
+    c(),          # 14 death after vaccination after infection
+    c(11, 18),    # 15 infection 2 after vaccination
+    c(),          # 16 death after recovery after infection after vaccination
+    c(8, 13, 19), # 17 recovery after infection 2
+    c(16, 20),    # 18 recovery after infection 2 after vaccination
+    c(8, 9, 21),  # 19 infection 3
+    c(),          # 20 infection 3 after vaccination (dummy)
+    c(8, 13, 22), # 21 recovery after infection 3
+    c()           # 22 infection 4 (dummy)
+  ), 
+  names = c(
+    "alive event-free", "vaccination", "infection 1", "death event-free", 
+    "infection 1 after vacc", "death after vaccination", "recovery after infection 1", 
+    "vaccination after infection", "death after infection", 
+    "recovery after infection 1 after vacc", 
+    "death after infection after vacc", "infection 2", 
+    "death after recovery after infection", "death after vaccination after infection ", 
+    "infection 2 after vacc", "death after recovery after infection after vacc", 
+    "recovery after infection 2", "recovery after infection 2 after vacc", 
+    "infection 3", "infection 3 after vacc (dummy)", 
+    "recovery after infection 3", "infection 4 (dummy)" 
+  )
+)
+tmat3
+tmat3 %>%
+  as_tibble(rownames = "from") %>%
+  pivot_longer(-from, names_to = "to", values_to = "trans") %>%
+  filter(!is.na(trans)) %>%
+  print(n = Inf) # OK
+
+data_2020_2021 %>%
+  select(RINPERSOON, entry, vacc, contains("vacc_infect"), contains("vacc_rec")) %>%
+  select(-ends_with("_s")) %>%
+  pivot_longer(cols = -c(RINPERSOON, entry)) %>%
+  filter(!is.na(value) & value <= entry) %>%
+  group_by(name) %>%
+  summarise(n = n())
+
+# get starting states:
+table(data_2020_2021$start_infect_s, useNA = "ifany")
+data_2020_2021 <- data_2020_2021 %>%
+  mutate(
+    start3_s = ifelse(!is.na(start_infect_s),
+      ifelse(grepl("after", start_infect_s) |
+        (is.na(date_vaccination) | (!is.na(date_vaccination) & date_vaccination > start)),
+      start_infect_s, "vaccination after infection"
+      ),
+      ifelse(!is.na(date_vaccination) & date_vaccination <= start,
+        "vaccination", "alive event-free"
+      )
+    ),
+    start3_s_n = case_when(
+      start3_s == "alive event-free" ~ 1,
+      start3_s == "vaccination" ~ 2,
+      start3_s == "before_vacc_infect_1" ~ 3,
+      start3_s == "before_vacc_rec_1" ~ 7,
+      start3_s == "vaccination after infection" ~ 8
+    )
+  )
+table(data_2020_2021$start3_s, useNA = "ifany")
+
+data_2020_2021 %>%
+  summarise(n(),
+    no_vacc = length(which(is.na(date_vaccination))),
+    min_int = min(date_vaccination - start, na.rm = T),
+    max_int = max(date_vaccination - start, na.rm = T)
+  )
+# some never had vaccination, the rest had vaccination after start
+data_2020_2021 %>%
+  filter(start3_s %in% c("alive event-free", "vaccination", "vaccination after infection")) %>%
+  group_by(start3_s) %>%
+  summarise(n(),
+    no_vacc = length(which(is.na(date_vaccination))),
+    min_vacc_int = min(date_vaccination - start, na.rm = T),
+    max_vacc_int = max(date_vaccination - start, na.rm = T),
+    no_infect = length(which(is.na(infect_1))),
+    min_infect_int = min(infect_1 - start, na.rm = T),
+    max_infect_int = max(infect_1 - start, na.rm = T)
+  ) %>%
+  print(width = Inf)
+
+data_2020_2021 <- data_2020_2021 %>%
+  mutate(
+    across(
+      c((contains("before_vacc") | contains("after_vacc")) & ends_with("_s")),
+      ~ ifelse(is.na(.x), 0, .x)
+    ),
+    across(
+      c((contains("before_vacc") | contains("after_vacc")) & ends_with("_int")),
+      ~ ifelse(is.na(.x), srv, .x)
+    )
+  )
+
+df_infect_vacc %>%
+  filter(time == date_vaccination) %>%
+  select(state, timing) %>%
+  unique()
+# none
+
+# create msprep object: too large dataset for msprep -> do in chunks
+data_2020_2021$chunk <- rep(seq_len(ceiling(nrow(data_2020_2021) / 99997)),
+  each = 99997, length.out = nrow(data_2020_2021)
+)
+table(data_2020_2021$chunk) # 39 chunks
+
+for (i in 1:max(data_2020_2021$chunk)) {
+  saveRDS(
+    msprep(
+      data = data_2020_2021 %>% filter(data_2020_2021$chunk == i) %>%
+        # dummies with full path through model
+        add_row(
+          RINPERSOON = "dummy1", entry_s = 1, entry = 0,
+          before_vacc_infect_1_s = 1, before_vacc_infect_1_int = 1,
+          before_vacc_rec_1_s = 1, before_vacc_rec_1_int = 2,
+          before_vacc_infect_2_s = 1, before_vacc_infect_2_int = 3,
+          before_vacc_rec_2_s = 1, before_vacc_rec_2_int = 4,
+          before_vacc_infect_3_s = 1, before_vacc_infect_3_int = 5,
+          before_vacc_rec_3_s = 1, before_vacc_rec_3_int = 6,
+          vacc_s = "vaccination", vacc = 8,
+          after_vacc_infect_1_s = 1, after_vacc_infect_1_int = 9,
+          after_vacc_rec_1_s = 1, after_vacc_rec_1_int = 10,
+          after_vacc_infect_2_s = 1, after_vacc_infect_2_int = 11,
+          after_vacc_rec_2_s = 1, after_vacc_rec_2_int = 12,
+          srv_s = 1, srv = 13
+        ) %>%
+        add_row(
+          RINPERSOON = "dummy2", entry_s = 1, entry = 0,
+          before_vacc_infect_1_s = 1, before_vacc_infect_1_int = 1,
+          before_vacc_rec_1_s = 1, before_vacc_rec_1_int = 2,
+          before_vacc_infect_2_s = 1, before_vacc_infect_2_int = 3,
+          before_vacc_rec_2_s = 1, before_vacc_rec_2_int = 4,
+          before_vacc_infect_3_s = 1, before_vacc_infect_3_int = 5,
+          before_vacc_rec_3_s = 1, before_vacc_rec_3_int = 6,
+          vacc_s = "vaccination", vacc = 8,
+          after_vacc_infect_1_s = 1, after_vacc_infect_1_int = 9,
+          after_vacc_rec_1_s = 1, after_vacc_rec_1_int = 10,
+          after_vacc_infect_2_s = 1, after_vacc_infect_2_int = 11,
+          after_vacc_rec_2_s = 1, after_vacc_rec_2_int = 12,
+          srv_s = 1, srv = 13
+        ) %>%
+        mutate(
+          vacc_s = ifelse(vacc_s == "vaccination", 1, 0),
+          after_vacc_infect_3_s = 0, before_vacc_infect_4_s = 0
+        ),
+      trans = tmat3, id = "RINPERSOON",
+      time = c(
+        "entry", "vacc",
+        "before_vacc_infect_1_int", "srv",
+        "after_vacc_infect_1_int", "srv",
+        "before_vacc_rec_1_int", "vacc",
+        "srv", "after_vacc_rec_1_int",
+        "srv", "before_vacc_infect_2_int",
+        "srv", "srv", "after_vacc_infect_2_int",
+        "srv", "before_vacc_rec_2_int",
+        "after_vacc_rec_2_int", "before_vacc_infect_3_int",
+        "srv", "before_vacc_rec_3_int", "srv"
+      ),
+      status = c(
+        "entry_s", "vacc_s",
+        "before_vacc_infect_1_s", "srv_s",
+        "after_vacc_infect_1_s", "srv_s",
+        "before_vacc_rec_1_s", "vacc_s",
+        "srv_s", "after_vacc_rec_1_s",
+        "srv_s", "before_vacc_infect_2_s",
+        "srv_s", "srv_s", "after_vacc_infect_2_s",
+        "srv_s", "before_vacc_rec_2_s",
+        "after_vacc_rec_2_s", "before_vacc_infect_3_s",
+        "after_vacc_infect_3_s", "before_vacc_rec_3_s", "before_vacc_infect_4_s"
+      ),
+      start = list(
+        state = c(data_2020_2021$start3_s_n[data_2020_2021$chunk == i], 1, 1),
+        time = c(data_2020_2021$entry[data_2020_2021$chunk == i], 0, 0)
+      )
+    ),
+    paste0("ms3.", i, ".rds")
+  )
+}
+# combine the chunks to get the full msprep object
+ms3 <- bind_rows(lapply(list.files(pattern = "ms3.*.rds")[which(!grepl("June", list.files(pattern = "ms3.*.rds")))][1:39], readRDS)) %>%
+  filter(!grepl("dummy", RINPERSOON))
+
+head(ms3)
+events(ms3)
+saveRDS(ms3, "ms3.rds")
+
+# combine recurrent states and transitions:
+tmat3_s <- transMat(
+  list(
+    c(2, 3, 4),  # 1 alive event-free
+    c(5, 6),     # 2 vaccination
+    c(7, 8, 9),  # 3 infection
+    c(),         # 4 death event-free
+    c(10, 11),   # 5 infection after vaccination
+    c(),         # 6 death after vaccination
+    c(3, 8, 12), # 7 recovery after infection
+    c(5, 13),    # 8 vaccination after infection (day of vaccination, possibly before recovery is reached) 
+    c(),         # 9 death after infection
+    c(5, 14),    # 10 recovery after infection after vaccination
+    c(),         # 11 death after infection after vaccination
+    c(),         # 12 death after recovery after infection
+    c(),         # 13 death after vaccination after infection
+    c()          # 14 death after recovery after infection after vaccination
+  ), 
+  names = c( # use final names:
+    "alive event-free", "vaccination", "recent infection", "death event-free", 
+    "recent infection after vaccination", "death after vaccination", "non-recent infection", 
+    "vaccination after infection", "death after recent infection", 
+    "non-recent infection after vaccination", 
+    "death after recent infection after vaccination", "death after non-recent infection",
+    "death after vaccination after infection",  
+    "death after non-recent infection after vaccination"
+  )
+)
+
+tmat3_s
+tmat3_s %>%
+  as_tibble(rownames = "from") %>%
+  pivot_longer(-from, names_to = "to", values_to = "trans") %>%
+  filter(!is.na(trans)) %>%
+  print(n = Inf) # OK
+
+# renumber from, to and trans
+ms3_s <- ms3 %>%
+  mutate(
+    from = case_when(
+      from %in% c(1:11) ~ from,
+      from %in% c(12, 19, 22) ~ 3,
+      from %in% c(13, 14) ~ from - 1,
+      from %in% c(15, 20) ~ 5,
+      from == 16 ~ 14,
+      from %in% c(17, 21) ~ 7,
+      from == 18 ~ 10
+    ),
+    to = case_when(
+      to %in% c(1:11) ~ to,
+      to %in% c(12, 19, 22) ~ 3,
+      to %in% c(13, 14) ~ to - 1,
+      to %in% c(15, 20) ~ 5,
+      to == 16 ~ 14,
+      to %in% c(17, 21) ~ 7,
+      to == 18 ~ 10
+    ),
+    trans = case_when(
+      trans %in% c(1:10, 13:17) ~ trans,
+      trans %in% c(11, 23, 31) ~ 12,
+      trans %in% c(12, 25, 33) ~ 11,
+      trans %in% c(18, 28) ~ 7,
+      trans %in% c(19, 29) ~ 8,
+      trans %in% c(20, 30) ~ 6,
+      trans == 21 ~ 10,
+      trans == 22 ~ 9,
+      trans %in% c(24, 32) ~ 13,
+      trans == 26 ~ 17,
+      trans == 27 ~ 16
+    )
+  )
+attr(ms3_s, "trans") <- tmat3_s
+
+# check from:
+cbind(
+  ms3 %>% select(from) %>%
+    left_join(data.frame(from = c(1:length(rownames(tmat3))), name = rownames(tmat3))),
+  ms3_s %>% select(from) %>%
+    left_join(data.frame(from = c(1:length(rownames(tmat3_s))), name = rownames(tmat3_s))) %>%
+    rename(from_s = from, name_s = name)
+) %>%
+  unique() %>%
+  arrange(name_s, name)
+# check to:
+cbind(
+  ms3 %>% select(to) %>%
+    left_join(data.frame(to = c(1:length(rownames(tmat3))), name = rownames(tmat3))),
+  ms3_s %>% select(to) %>%
+    left_join(data.frame(to = c(1:length(rownames(tmat3_s))), name = rownames(tmat3_s))) %>%
+    rename(to_s = to, name_s = name)
+) %>%
+  unique() %>%
+  arrange(name_s, name) 
+# check trans:
+cbind(
+  ms3 %>% select(trans) %>% left_join(tmat3 %>% as_tibble(rownames = "from") %>%
+    pivot_longer(-from, names_to = "to", values_to = "trans") %>%
+    filter(!is.na(trans)) %>% mutate(name = paste(from, "->", to)) %>%
+    select(trans, name)),
+  ms3_s %>% select(trans) %>% left_join(tmat3_s %>% as_tibble(rownames = "from") %>%
+    pivot_longer(-from, names_to = "to", values_to = "trans") %>%
+    filter(!is.na(trans)) %>% mutate(name = paste(from, "->", to)) %>%
+    select(trans, name)) %>%
+    rename(trans_s = trans, name_s = name)
+) %>%
+  unique() %>%
+  arrange(name_s, name) 
+
+events(ms3_s)
+
+# select period starting from 31 May 2020 (before that there was no reliable testing)
+as.numeric(as.Date("2020-05-31") - as.Date("2019-12-31")) # 152 days
+ms3_s_June <- ms3_s %>%
+  mutate(
+    Tstart = Tstart - 152, Tstart = ifelse(Tstart < 0, 0, Tstart),
+    Tstop = Tstop - 152
+  ) %>%
+  mutate(time = Tstop - Tstart) %>%
+  filter(Tstop > 0)
+nrow(ms3_s_June)
+
+ms3_s_June %>%
+  filter(RINPERSOON %in% RINPERSOON[Tstart == max(Tstop)][1])
+# since censoring occurs on 31 December 2021, persons can have rows with time 0 (if they also had an infection or a vaccination on 31 December 2021)
+ms3_s_June %>%
+  filter(time == 0) %>%
+  select(from:status) %>%
+  unique()
+# doesn't occur anywhere else; remove these rows
+ms3_s_June <- ms3_s_June %>% filter(time != 0)
+nrow(ms3_s_June)
+
+attr(ms3_s_June, "trans") <- tmat3_s
+class(ms3_s_June) <- c("msdata", "data.frame")
+
+events(ms3_s_June) # no empty rows -> OK
+
+# add subset variable
+if (!"sex" %in% names(ms3_s_June)) {
+  ms3_s_June <- ms3_s_June %>% left_join(
+    data_2020_2021 %>%
+      select(RINPERSOON, sex, age_1Jan20, sex_age),
+    by = "RINPERSOON"
+  )
+}
+saveRDS(ms3_s_June, "ms3_s_June.rds")
+
+# order of states
+state_levels_ms <- c(
+  "death after non-recent infection after vaccination",
+  "non-recent infection after vaccination", "death after vaccination after infection",
+  "death after non-recent infection", "death after recent infection after vaccination",
+  "recent infection after vaccination", "vaccination after infection",
+  "non-recent infection", "death after vaccination", "vaccination", "recent infection",
+  "death after recent infection", "death event-free", "alive event-free"
+)
+
+state_levels_ms_relsurv <- c(
+  "death after non-recent infection after vaccination.p",
+  "death after non-recent infection after vaccination.e",
+  "non-recent infection after vaccination", "death after vaccination after infection.p",
+  "death after vaccination after infection.e", "death after non-recent infection.p",
+  "death after non-recent infection.e", "death after recent infection after vaccination.p",
+  "death after recent infection after vaccination.e", "recent infection after vaccination",
+  "vaccination after infection", "non-recent infection", "death after vaccination.p",
+  "death after vaccination.e", "vaccination", "recent infection",
+  "death after recent infection.p", "death after recent infection.e", "death event-free.p",
+  "death event-free.e", "alive event-free"
+)
+
+# numbers at risk (present in state)
+df_ms_counts <- ms3_s_June %>%
+  mutate(
+    LM_0 = ifelse(Tstart <= 0 & Tstop > 0, 1, 0),
+    LM_214 = ifelse(Tstart <= 214 & Tstop > 214, 1, 0),
+    LM_365 = ifelse(Tstart <= 365 & Tstop > 365, 1, 0),
+    LM_457 = ifelse(Tstart <= 457 & Tstop > 457, 1, 0),
+    LM_548 = ifelse(Tstart <= 548 & Tstop > 548, 1, 0)
+  ) %>%
+  pivot_longer(cols = c(starts_with("LM")), names_to = "start", values_to = "present") %>%
+  filter(present == 1) %>%
+  mutate(start = as.numeric(gsub("LM_", "", start))) %>%
+  select(RINPERSOON, from, sex_age, start) %>%
+  unique() %>%
+  group_by(start, from, sex_age) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  left_join(data.frame(state = rownames(tmat3_s), from = 1:length(rownames(tmat3_s))),
+    by = "from"
+  ) %>%
+  mutate(LM = as.Date("2020-06-01") + start)
+saveRDS(df_ms_counts, "df_ms_counts.rds")
+
+head(df_ms_counts)
+df_ms_counts %>%
+  group_by(start, state) %>%
+  summarise(sum = sum(n), .groups = "drop") %>%
+  filter(sum >= 10) %>%
+  pivot_wider(id_cols = state, names_from = start, values_from = sum)
+df_ms_counts %>%
+  filter(n >= 10) %>%
+  pivot_wider(id_cols = c(sex_age, state), names_from = start, values_from = n)
+df_ms_counts %>%
+  filter(n >= 10) %>%
+  mutate(
+    sex_age = factor(gsub("male", "Men", gsub("female", "Women", sex_age)),
+      levels = rev(c(
+        "Women <65", "Men <65",
+        "Women 65-69", "Men 65-69",
+        "Women 70-79", "Men 70-79",
+        "Women 80-89", "Men 80-89",
+        "Women 90+", "Men 90+"
+      ))
+    ),
+    date = start + as.Date("2020-06-01"),
+    state = factor(state, levels = c(
+      "alive event-free", "vaccination",
+      "recent infection after vaccination",
+      "recent infection", "vaccination after infection",
+      "non-recent infection after vaccination",
+      "non-recent infection"
+    ))
+  ) %>%
+  ggplot(aes(x = as.factor(date), y = n, fill = sex_age)) +
+  geom_col(color = "black") +
+  facet_wrap(~state, scales = "free_y") +
+  theme_bw() +
+  theme(
+    axis.text = element_text(color = "black"),
+    legend.title = element_blank(), axis.title.x = element_blank(),
+    axis.text.x = element_text(angle = 90), panel.grid = element_blank()
+  ) +
+  scale_x_discrete() +
+  scale_fill_viridis_d(option = "H", begin = 0.1, direction = -1) +
+  ylab("number of unique persons present in state on landmark time\n(group sizes <10 not shown)")
+
+df_ms_counts %>%
+  filter(n >= 10) %>%
+  group_by(start, from) %>%
+  mutate(total = sum(n), prop = n / total) %>%
+  mutate(
+    sex_age = factor(gsub("male", "Men", gsub("female", "Women", sex_age)),
+      levels = rev(c(
+        "Women <65", "Men <65",
+        "Women 65-69", "Men 65-69",
+        "Women 70-79", "Men 70-79",
+        "Women 80-89", "Men 80-89",
+        "Women 90+", "Men 90+"
+      ))
+    ),
+    date = start + as.Date("2020-06-01"),
+    state = factor(state, levels = c(
+      "alive event-free", "vaccination",
+      "recent infection after vaccination",
+      "recent infection", "vaccination after infection",
+      "non-recent infection after vaccination",
+      "non-recent infection"
+    ))
+  ) %>%
+  ggplot(aes(x = as.factor(date), y = prop, fill = sex_age)) +
+  geom_col(color = "black") +
+  facet_wrap(~state) +
+  theme_bw() +
+  theme(
+    axis.text = element_text(color = "black"),
+    legend.title = element_blank(), axis.title.x = element_blank(),
+    axis.text.x = element_text(angle = 90), panel.grid = element_blank()
+  ) +
+  scale_x_discrete() +
+  scale_fill_viridis_d(option = "H", begin = 0.1, direction = -1) +
+  ylab("distribution of sex/age categories per state and landmark time\n(group sizes <10 not shown")
+
+df_ms_counts %>%
+  filter(n >= 10) %>%
+  group_by(start, sex_age) %>%
+  mutate(total = sum(n), prop = n / total) %>%
+  ungroup() %>%
+  pivot_wider(id_cols = c(start, sex_age), names_from = from, values_from = prop) %>%
+  print(n = Inf) %>%
+  filter(if_any(c(`1`, `3`, `7`, `2`, `5`, `8`, `10`), ~ !is.na(.x) & .x > 0.90))
+
+df_ms_counts %>%
+  filter(n >= 10) %>%
+  group_by(start, sex_age) %>%
+  mutate(total = sum(n), prop = n / total) %>%
+  mutate(
+    sex_age = factor(gsub("male", "Men", gsub("female", "Women", sex_age)),
+      levels = rev(c(
+        "Women <65", "Men <65",
+        "Women 65-69", "Men 65-69",
+        "Women 70-79", "Men 70-79",
+        "Women 80-89", "Men 80-89",
+        "Women 90+", "Men 90+"
+      ))
+    ),
+    date = start + as.Date("2020-06-01"),
+    state = factor(state, levels = c(
+      "alive event-free", "vaccination",
+      "recent infection after vaccination",
+      "recent infection", "vaccination after infection",
+      "non-recent infection after vaccination",
+      "non-recent infection"
+    ))
+  ) %>%
+  ggplot(aes(x = as.factor(date), y = prop, fill = state)) +
+  geom_col(color = "black") +
+  facet_wrap(~sex_age) +
+  theme_bw() +
+  theme(
+    axis.text = element_text(color = "black"),
+    legend.title = element_blank(), axis.title.x = element_blank(),
+    axis.text.x = element_text(angle = 90), panel.grid = element_blank()
+  ) +
+  scale_x_discrete() +
+  scale_fill_viridis_d(option = "H", begin = 0.1, direction = -1) +
+  ylab("distribution of sex/age categories per state and landmark time\n(group sizes <10 not shown")
+
+# get at risk numbers for each timepoint
+df_ms_atrisk <- ms3_s_June %>%
+  select(RINPERSOON, from, Tstart, Tstop, sex_age) %>%
+  unique()
+df_ms_atrisk <- df_ms_atrisk %>% count(from, Tstart, Tstop, sex_age)
+df_ms_atrisk <- df_ms_atrisk %>% mutate(Tstop2 = Tstop - 1)
+df_ms_atrisk <- df_ms_atrisk %>%
+  rowwise() %>%
+  do(data.frame(
+    from = .$from, sex_age = .$sex_age, n = .$n,
+    time = seq(.$Tstart, .$Tstop2, by = 1)
+  ))
+head(df_ms_atrisk)
+df_ms_atrisk <- df_ms_atrisk %>%
+  group_by(from, sex_age, time) %>%
+  summarise(n = sum(n), .groups = "drop") %>%
+  left_join(
+    data.frame(
+      from = 1:length(tmat3_s),
+      from_name = factor(rownames(tmat3_s), levels = c(rownames(tmat3_s)))
+    ),
+    by = "from"
+  )
+```
+
+```{r diagram}
+# box diagram showing the structure of the multi-state model
+  # states (boxes)
+df_states <- data.frame(state = rownames(tmat3_s)) %>%
+  mutate(
+    xmin = case_when(
+      state %in% c("death event-free", "alive event-free") ~ 1,
+      state %in% c(
+        "death after vaccination", "vaccination", "recent infection",
+        "death after recent infection"
+      ) ~ 25,
+      state %in% c(
+        "death after recent infection after vaccination",
+        "recent infection after vaccination", "vaccination after infection",
+        "non-recent infection"
+      ) ~ 50,
+      T ~ 75
+    ),
+    xmax = xmin + 20,
+    xmid = xmin + 10,
+    ymax = case_when(
+      state %in% c(
+        "death event-free", "death after vaccination",
+        "death after recent infection after vaccination",
+        "death after non-recent infection after vaccination"
+      ) ~ 100,
+      state %in% c(
+        "alive event-free", "vaccination", "recent infection after vaccination",
+        "non-recent infection after vaccination"
+      ) ~ 80,
+      state %in% c(
+        "recent infection", "vaccination after infection",
+        "death after vaccination after infection"
+      ) ~ 60,
+      T ~ 40
+    ),
+    ymin = ymax - 10,
+    ymid = ymax - 5,
+    color = c(
+      "#00B0F0", "#00B0F0", "#00B0F0", "#CC0000", "#00B0F0", "#CC0000", "#00B0F0",
+      "#00B0F0", "#CC0000", "#00B0F0", "#CC0000", "#CC0000", "#CC0000", "#CC0000"
+    )
+  ) %>%
+  rowwise() %>%
+  mutate(fill = colorRampPalette(c(color, "white"))(4)[3]) %>%
+  ungroup()
+df_states
+
+  # transitions (arrows)
+df_trans <- melt(tmat3_s) %>%
+  filter(!is.na(value)) %>%
+  select(-value) %>%
+  left_join(df_states %>% rename(from = state), by = "from") %>%
+  left_join(df_states %>% rename(to = state), by = "to") %>%
+  mutate(
+    x = case_when(
+      xmid.x == xmid.y ~ xmid.x,
+      xmid.x < xmid.y ~ xmax.x,
+      T ~ xmin.x
+    ),
+    xend = case_when(
+      xmid.x == xmid.y ~ xmid.x,
+      xmid.x < xmid.y ~ xmin.y,
+      T ~ xmax.y
+    ),
+    y = case_when(
+      xmid.x == xmid.y & ymid.x < ymid.y ~ ymax.x,
+      xmid.x == xmid.y ~ ymin.x,
+      T ~ ymid.x
+    ),
+    yend = case_when(
+      xmid.x == xmid.y & ymid.x < ymid.y ~ ymin.y,
+      xmid.x == xmid.y ~ ymax.y,
+      T ~ ymid.y
+    )
+  )
+df_trans
+
+# plot diagram
+ggplot() +
+  geom_segment(
+    data = df_trans, aes(x = x, xend = xend, y = y, yend = yend),
+    arrow = arrow(length = unit(0.03, "npc"), type = "closed", angle = 20)
+  ) +
+  geom_rect(
+    data = df_states, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+    fill = "white",
+    color = df_states$color, linewidth = 1.5
+  ) +
+  geom_text(
+    data = df_states, aes(x = xmid, y = ymid, label = stringr::str_wrap(state, 20)),
+    hjust = 0.5, vjust = 0.5, size = 4
+  ) +
+  theme_void() +
+  scale_x_continuous(expand = c(0.01, 0.01)) +
+  scale_y_continuous(expand = c(0.01, 0.01))
+
+# add numbers to state names
+ggplot() +
+  geom_segment(
+    data = df_trans, aes(x = x, xend = xend, y = y, yend = yend),
+    arrow = arrow(length = unit(0.03, "npc"), type = "closed", angle = 20)
+  ) +
+  geom_rect(
+    data = df_states, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+    fill = "white",
+    color = df_states$color, linewidth = 1.5
+  ) +
+  geom_text(
+    data = df_states %>%
+      mutate(state = paste0(c(1, 4, 5, 2, 8, 3, 10, 9, 6, 12, 7, 14, 13, 11), ". ", df_states$state)),
+    aes(x = xmid, y = ymid, label = stringr::str_wrap(state, 20)),
+    hjust = 0.5, vjust = 0.5, size = 4
+  ) +
+  theme_void() +
+  scale_x_continuous(expand = c(0.01, 0.01)) +
+  scale_y_continuous(expand = c(0.01, 0.01))
+```
+
+## without relsurv and with relsurv based on HMD 2015-2019
+```{r mstate without relsurv and HMD 2015-2019}
+# calculate hazards and probabilities
+func_mstate(
+  msdata = ms3_s_June %>%
+    mutate(
+      year = as.Date("2020-05-31"),
+      age = age_1Jan20 * 365.241 - 1 + 152
+    ),
+  trans = attr(ms3_s_June, "trans"),
+  strata = "sex_age",
+  LM = c(0, 366 - 152, 517 - 152, 609 - 152, 700 - 152), LM_type = "both",
+  from = c(1, 2, 3, 5, 7, 8, 10), survival_type = "both",
+  ratetable = readRDS("nedpop_1519.rds"), ratetable_name = "nedpop_1519",
+  split.transitions = c(3, 5, 8, 10, 13, 15, 17),
+  time.format = "days",
+  var.pop.haz = "fixed"
+)
+unique(warnings())
+```
+
+## with relsurv based on HMD 2019
+```{r mstate with relsurv based on 2019}
+# calculate hazards and probabilities
+func_mstate(
+  msdata = ms3_s_June %>%
+    mutate(
+      year = as.Date("2020-05-31"),
+      age = age_1Jan20 * 365.241 - 1 + 152
+    ),
+  trans = attr(ms3_s_June, "trans"),
+  strata = "sex_age",
+  LM = c(0, 366 - 152, 517 - 152, 609 - 152, 700 - 152), LM_type = "both",
+  from = c(1, 2, 3, 5, 7, 8, 10), survival_type = "relsurv",
+  ratetable = readRDS("nedpop2.rds"), ratetable_name = "nedpop2",
+  split.transitions = c(3, 5, 8, 10, 13, 15, 17),
+  time.format = "days",
+  var.pop.haz = "fixed"
+)
+unique(warnings())
+```
+
+## with relsurv based on microdata: hazards per sex and age
+```{r mstate year}
+# calculate hazards and probabilities
+func_mstate(
+  msdata = ms3_s_June %>%
+    mutate(
+      year = as.Date("2020-05-31"),
+      age = age_1Jan20 * 365.241 - 1 + 152
+    ),
+  trans = attr(ms3_s_June, "trans"),
+  strata = "sex_age",
+  LM = c(0, 366 - 152, 517 - 152, 609 - 152, 700 - 152), LM_type = "both",
+  from = c(1, 2, 3, 5, 7, 8, 10), survival_type = "relsurv",
+  ratetable = readRDS("nedpop_year.rds"), ratetable_name = "nedpop_year",
+  split.transitions = c(3, 5, 8, 10, 13, 15, 17),
+  time.format = "days",
+  var.pop.haz = "fixed"
+)
+unique(warnings())
+```
+
+## with relsurv based on microdata: per sex, age and month
+```{r mstate month}
+# calculate hazards and probabilities
+func_mstate(
+  msdata = ms3_s_June %>%
+    mutate(
+      year = as.Date("2020-05-31"),
+      age = age_1Jan20 * 365.241 - 1 + 152
+    ),
+  trans = attr(ms3_s_June, "trans"),
+  strata = "sex_age",
+  LM = c(0, 366 - 152, 517 - 152, 609 - 152, 700 - 152), LM_type = "both",
+  from = c(1, 2, 3, 5, 7, 8, 10), survival_type = "relsurv",
+  ratetable = readRDS("nedpop_months.rds"), ratetable_name = "nedpop_months",
+  split.transitions = c(3, 5, 8, 10, 13, 15, 17),
+  time.format = "days",
+  var.pop.haz = "fixed"
+)
+unique(warnings())
+```
+
+```{r check excess mortality after vaccination}
+# vaccination campaign: first frail people, then based on age -> to correctly analyse this, we need to use the same age groups as used in the vaccination campaign:
+ms3_s_June2 <- ms3_s_June %>%
+  left_join(data_2020_2021 %>% select(RINPERSOON, BIRTHDAY) %>%
+    mutate(
+      birthyear = as.numeric(substr(BIRTHDAY, 1, 4)),
+      birthcohort = case_when(
+        birthyear < 1931 ~ "<1931",
+        birthyear < 1936 ~ "1931-1935",
+        birthyear < 1941 ~ "1936-1940",
+        birthyear == 1956 ~ "1956",
+        birthyear < 1947 ~ "1941-1946",
+        birthyear < 1952 ~ "1947-1951",
+        birthyear == 1952 ~ "1952",
+        birthyear < 1956 ~ "1953-1955"
+      ),
+      birthcohort = factor(birthcohort,
+        levels = c(
+          "<1931", "1931-1935", "1936-1940", "1941-1946",
+          "1947-1951", "1952", "1953-1955", "1956"
+        )
+      )
+    ))
+ms3_s_June2 %>% select(RINPERSOON, birthcohort, sex_age) %>% unique() %>% 
+  count(birthcohort, sex_age)
+df_ms_counts_birthcohort <- ms3_s_June2 %>% 
+  select(RINPERSOON, birthcohort) %>% unique() %>% 
+  count(birthcohort) %>% mutate(n = ifelse(n >= 10, n, NA))
+saveRDS(df_ms_counts_birthcohort, "df_ms_counts_birthcohort.rds")
+
+# calculate hazards and probabilities
+func_mstate(
+  msdata = ms3_s_June2 %>%
+    mutate(
+      year = as.Date("2020-05-31"),
+      age = age_1Jan20 * 365.241 - 1 + 152
+    ),
+  trans = attr(ms3_s_June2, "trans"),
+  strata = "birthcohort", total = F,
+  survival_type = "relsurv",
+  ratetable = readRDS("nedpop_months.rds"), ratetable_name = "nedpop_months",
+  split.transitions = c(3, 5, 8, 10, 13, 15, 17),
+  time.format = "days",
+  var.pop.haz = "fixed"
+)
+unique(warnings())
+```
+
+# Cumulative incidences
+```{r cuminc}
+#### infection ####
+# with death as competing event
+fit_inf_deathComp <- Cuminc("infectJun", "infectJun_s",
+  data_2020_2021 %>%
+    filter(start <= as.Date("2020-01-01") & infectJun > 152) %>%
+    mutate(infectJun = infectJun - 152) %>%
+    as.data.frame(),
+  failcodes = c("infection", "death")
+)
+saveRDS(fit_inf_deathComp, "fit_inf_deathComp.rds")
+
+# subset analyses
+fit_inf_deathComp_subsets <- Cuminc("infectJun", "infectJun_s",
+  data_2020_2021 %>%
+    filter(start <= as.Date("2020-01-01") & infectJun > 152) %>%
+    mutate(infectJun = infectJun - 152) %>%
+    as.data.frame(),
+  failcodes = c("infection", "death"),
+  group = "sex_age"
+)
+saveRDS(fit_inf_deathComp_subsets, "fit_inf_deathComp_subsets.rds")
+
+#### vaccination #####
+# with death as competing event
+fit_vacc_deathComp <- Cuminc("vacc", "vacc_s",
+  data_2020_2021 %>%
+    filter(start <= as.Date("2020-01-01") & vacc > 152) %>%
+    mutate(vacc = vacc - 152) %>%
+    as.data.frame(),
+  failcodes = c("vaccination", "death")
+)
+saveRDS(fit_vacc_deathComp, "fit_vacc_deathComp.rds")
+
+# subset analyses
+fit_vacc_deathComp_subsets <- Cuminc("vacc", "vacc_s",
+  data_2020_2021 %>%
+    filter(start <= as.Date("2020-01-01") & vacc > 152) %>%
+    mutate(vacc = vacc - 152) %>%
+    as.data.frame(),
+  group = "sex_age",
+  failcodes = c("vaccination", "death")
+)
+saveRDS(fit_vacc_deathComp_subsets, "fit_vacc_deathComp_subsets.rds")
+
+#### use method of RIVM ####
+# proportion of all alive on 1 March 2021 with at least 1 dose during 2021
+df_vacc_RIVM <- data_2020_2021 %>%
+  filter(entry == 0 & srv > as.numeric(as.Date("2021-03-01") - as.Date("2019-12-31"))) %>%
+  mutate(
+    birthyear = as.numeric(substr(BIRTHDAY, 1, 4)),
+    year_group = case_when(
+      birthyear < 1931 ~ "<1931",
+      birthyear < 1936 ~ "1931-1935",
+      birthyear < 1941 ~ "1936-1940",
+      birthyear < 1946 ~ "1941-1945",
+      birthyear < 1951 ~ "1946-1950",
+      birthyear < 1956 ~ "1951-1955",
+      T ~ "1956"
+    )
+  ) %>%
+  group_by(year_group) %>%
+  summarise(
+    max_birthyear = max(birthyear),
+    total = n(),
+    vacc = length(which(vacc_s == "vaccination")),
+    prop = round(vacc / total, 2)
+  ) %>%
+  mutate(
+    prop_RIVM = case_when( 
+      grepl("<1931", year_group) ~ 0.89, # from RIVM report
+      grepl("31|51", year_group) ~ 0.93, # from RIVM report
+      grepl("36|41|46", year_group) ~ 0.94, # from RIVM report
+      T ~ 0.91 # from RIVM report
+    ))
+saveRDS(df_vacc_RIVM, "df_vacc_RIVM.rds")
+
+df_vacc_RIVM %>% mutate(
+    correctVacc_perc = prop / prop_RIVM,
+    incorrectvacc_perc = (prop_RIVM - prop) / prop_RIVM,
+    no_vacc = 1 - prop,
+    no_vacc_RIVM = 1 - prop_RIVM,
+    incorrectNovacc_perc = (no_vacc - no_vacc_RIVM) / no_vacc
+  ) %>%
+  print(width = Inf)
+
+df_vacc_RIVM %>% mutate(
+  vacc_RIVM = round(total * prop_RIVM),
+    vacc_diff = (vacc_RIVM - vacc) / vacc_RIVM,
+    no_vacc = total - vacc,
+    no_vacc_RIVM = total - vacc_RIVM,
+    no_vacc_diff = (no_vacc - no_vacc_RIVM) / no_vacc
+  ) %>%
+  print(width = Inf) %>%
+  select(-max_birthyear)
+```
+
+# save objects
+```{r save all objects, error=T}
+obj <- ls()
+for (i in 1:length(obj)) {
+  saveRDS(get(obj[i]), paste0("analyses_clean/", obj[i], ".rds"))
+}
+```
